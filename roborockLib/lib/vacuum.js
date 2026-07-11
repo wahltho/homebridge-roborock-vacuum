@@ -31,6 +31,7 @@ class vacuum {
 
     this.adapter.log.debug(`Robot key: ${robotModel}`);
     this.robotModel = robotModel;
+    this.emptyRoomMappingWarningLogged = false;
 
     this.message = new rrMessage(this.adapter);
 
@@ -385,10 +386,16 @@ class vacuum {
 
         // if no rooms have been named, processing them can't work
         if (mappedRooms.length < 1) {
-          this.adapter.log.warn(
-            `Failed to map rooms. You need to name your rooms via the mobile app on your phone.`
-          );
+          if (!this.emptyRoomMappingWarningLogged) {
+            this.adapter.log.warn(
+              `Failed to map rooms. You need to name your rooms via the mobile app on your phone.`
+            );
+            this.emptyRoomMappingWarningLogged = true;
+          } else {
+            this.adapter.log.debug(`Room mapping is still empty for ${duid}.`);
+          }
         } else {
+          this.emptyRoomMappingWarningLogged = false;
           for (const mappedRoom of mappedRooms) {
             const roomID = mappedRoom[1];
             const roomName = this.adapter.roomIDs[roomID];

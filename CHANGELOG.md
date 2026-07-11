@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.0.2-wahltho.1
+
+- **Fix**: Devices whose local TCP connection stays open but repeatedly times out now use cloud transport for the rest of the plugin session. Local transport is tested again after a plugin restart, avoiding recurring timeout cycles and log flooding while preserving automatic recovery checks.
+- **Fix**: Empty room mappings now warn once per device until a valid mapping is received, instead of repeating the same warning on every polling cycle.
+
 ## 2.0.1
 
 Stability and security hardening release based on a full plugin vulnerability scan. No new features, no configuration changes — updating is strongly recommended, especially on low-power hosts (NAS, Raspberry Pi).
