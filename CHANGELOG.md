@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.0-wahltho.1
+
+- **Upstream 2.1.0**: Adds a localized, stateful dock mop-wash switch for HAP and Matter, including dock capability detection and corrected `dock_type` processing.
+- **Retained fork fix**: Devices whose local TCP connection remains connected but repeatedly times out fail over to cloud transport for the rest of the plugin session.
+- **Retained fork fix**: Empty room mappings warn once per device until a valid mapping is received.
+
 ## 2.0.2-wahltho.1
 
 - **Fix**: Devices whose local TCP connection stays open but repeatedly times out now use cloud transport for the rest of the plugin session. Local transport is tested again after a plugin restart, avoiding recurring timeout cycles and log flooding while preserving automatic recovery checks.
