@@ -5,6 +5,7 @@ UserData
 clientID
 test.js
 node_modules
+*.tgz
 .DS_Store
 .vscod
 .idea
@@ -14,4 +15,3 @@ openspec/
 .gemini/
 AGENTS.md
 CLAUDE.md
-
