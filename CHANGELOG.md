@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.2.6+wahltho.1
+
+- **Version metadata**: Identify the local fork with SemVer build metadata instead of a prerelease suffix. Homebridge UI no longer offers upstream 2.2.6 as an update; genuinely newer upstream versions remain visible. Runtime code and dependencies are unchanged.
+
 ## 2.2.6-wahltho.1
 
 - **Upstream 2.2.6**: Includes automatic region detection, newer device states, corrected per-device updates, reduced polling, and DHCP reconnect recovery from the upstream 2.1.1 through 2.2.6 releases below.
