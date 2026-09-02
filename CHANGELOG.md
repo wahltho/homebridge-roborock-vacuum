@@ -1,10 +1,103 @@
 # Changelog
 
+## 2.2.6-wahltho.1
+
+- **Upstream 2.2.6**: Includes automatic region detection, newer device states, corrected per-device updates, reduced polling, and DHCP reconnect recovery from the upstream 2.1.1 through 2.2.6 releases below.
+- **Retained fork fix**: Repeatedly unanswered local requests select cloud transport for the rest of the plugin session. A successful TCP reconnect only clears a temporary connection-failure fallback, not this session-wide protection.
+- **Retained fork fix**: Empty room mappings warn once per device until a valid mapping is received.
+- **Packaging**: Keep generated files outside the source repository, include the upstream branding asset, and remove the obsolete `jszip` dependency from the lockfile.
+- **Security**: Raise the Axios dependency floor to 1.20.0 and refresh `follow-redirects` to 1.16.0, `form-data` to 4.0.6, `ip-address` to 10.7.0, and `ws` to 8.21.3 in the lockfile. Add HTTP compatibility checks for login forms, authentication headers, Hawk signing, and transport errors.
+
+## 2.2.6
+
+- **New Feature**: The Roborock region is now detected automatically from the account email when no endpoint is configured — the config UI's Region selector gains an "Auto detect (recommended)" option and new installs no longer need to know which server their account lives on. An explicitly chosen region keeps working exactly as before, and if detection fails the plugin falls back to the previous US default with a hint to pin the region manually. Two-factor login also benefits: it now sends the account's real registered country from the detection response instead of guessing it from the endpoint host (which mapped every EU account to Germany)
+
+- **Fix (HAP/Matter)**: Recognize the state codes newer models report, ported from the python-roborock reference tables. State 25 (a second "washing the mop" code used by the Q7 Max family), 33/34 (attaching/detaching the mop mid-run) and the B01/Q10-generation mopping states (6301–6310) now count as an active cleaning session, so HomeKit no longer shows those vacuums as off while they are mopping. The dock mop-wash switch also follows states 25 and 6310, and the Matter operational state maps the new codes (mopping → Running, duster wash → Cleaning mop)
+
+## 2.2.5
+
+- **Fix (HAP/Matter)**: Real-time device messages are now routed to the accessory of the device they came from. Previously every push payload was fanned out to all accessories, so with two or more vacuums one robot could briefly show another robot's state, battery, or error in HomeKit
+- **Fix (HAP)**: Unknown status values are no longer published to HomeKit. Before the first HomeData snapshot arrived, the battery could show 0% (with a normal low-battery flag) and the cleaning state could read as off; those characteristics now update only once the value is actually known, matching the guards the Matter accessories already had. The charging indicator also uses one consistent rule instead of two different comparisons in the create and update paths
+- **Fix (HAP/Matter)**: "Washing the mop" (state 23) now counts as cleaning everywhere. The HAP accessory and the shared API each kept their own cleaning-state table that disagreed on this state, so during a mid-run mop wash the vacuum tile flapped between on and off as push and poll updates alternated
+- **Fix (HAP)**: Removing outdated scene switches no longer skips every second one — the service list was being modified while it was iterated
+- **Fix**: Sending a command to a device shared from another account now logs a warning instead of crashing the command handler (shared devices get an accessory but no control channel)
+- **Change (efficiency)**: Removed a 1-per-second status poll per device whose results were never used (the timer now only exists for the opt-in current-room MQTT telemetry, which is its only consumer). Also removed periodic and startup requests whose responses fed nothing: `get_server_timer`, `get_timer`, `get_multi_maps_list`, the cleaning-history fetch (`get_clean_summary` plus up to 20 `get_clean_record` calls per device), an extra `get_status` round-trip in the room-mapping poll, a per-cycle firmware-update check, and a duplicate scene fetch at startup
+- **Change (efficiency)**: Devices that go offline now stop being polled until they come back — the online flag from every HomeData refresh starts and stops the per-device intervals
+- **Change (internal)**: Removed the inherited ioBroker object layer and other dead code from `roborockLib` (about 1,900 lines), including the unused map parser and packaging helper; the `jszip` dependency is gone. Plugin shutdown now also cancels in-flight request timers. The API surface consumed by the TypeScript plugin is now declared in `src/roborock_api.ts`, so lib-side renames fail the build instead of breaking HomeKit at runtime
+
+## 2.2.4
+
+- **New Feature (HAP)**: Consumable life (filter, main brush, side brush) is now exposed as HomeKit FilterMaintenance services — remaining life in percent plus a "change filter" alert when a consumable drops to 5% or less. Services are only created for consumables the device actually reports, and their names follow the plugin language
+- **New Feature (HAP)**: The vacuum's error state and cloud online flag are now surfaced on the main service as StatusFault and StatusActive, so HomeKit apps can flag a device that reported an error code or went offline
+- **Fix (Matter)**: Matter accessories no longer report their model as "Unknown" (or "Scene"/"Dock") — the model is resolved from the Roborock products table, the same source the HAP accessories always used
+- **Fix (HAP)**: The firmware version shown in Apple Home no longer stays empty or "Unknown". It was written only once at accessory creation, so a HomeData snapshot without the firmware field (or a later device OTA update) left HomeKit without the real version forever. The version is now refreshed from the device data on every HomeData poll
+
+## 2.2.3
+
+- **Fix (Matter)**: Matter vacuums no longer sit at "Updating…" in Apple Home with no state, battery, or controls (#59). The initial status was pushed before the Matter endpoint was registered — so the Matter server discarded it — and nothing published it again afterwards. The status (state, battery, charging, error, clean mode) is now seeded right after registration and re-synced on every Roborock HomeData poll, matching the update path the HAP accessories always had
+- **Fix (Matter)**: Real-time device broadcasts that arrive as raw protocol ids (dps 120–124) are now translated to named status fields once in the notification fan-out and shared by every accessory, so state, battery, and clean-mode changes reach Matter controllers immediately instead of waiting for the next poll. The HAP accessory consumes the same translated payload, replacing its own inline handling of dps 121/122
+- **Fix (Matter)**: A dock mop-wash switch restored from the Matter cache with a stale On state is now corrected at startup
+
+## 2.2.2
+
+- **Fix (config UI)**: 2FA verification and login no longer fail with the generic "The Homebridge UI did not respond in time" message on slow connections (#58). Cloud-backed actions (login, 2FA, device list) now get a 60-second budget in the UI instead of 15 seconds — 2FA verify and password login each make two sequential Roborock cloud requests, which could legitimately exceed the old limit. Each underlying cloud request is also capped at 20 seconds, so a genuinely unreachable Roborock server now surfaces the real network error instead of the generic timeout
+
+## 2.2.1
+
+Maintenance release — no functional changes to device control. Reworks the four code patterns flagged by the Homebridge verification security scan so the automated checks come back clean:
+
+- **Change**: The config UI server now loads the ESM-only `@homebridge/plugin-ui-utils` package via a native dynamic import in the uncompiled `homebridge-ui/server.js` bootstrap, replacing the `Function`-constructor workaround in the compiled UI bundle
+- **Change**: Translation catalogs are loaded through a static per-language table instead of a computed `require()` path; unknown languages still fall back to English
+- **Change**: The storage path is taken solely from the platform-provided config (with the existing local fallbacks); the redundant environment-variable lookup was removed
+- **Change**: Renamed internal identifiers in the photo RSA-keypair helper; keys are still generated fresh in-process and never read from disk
+
+## 2.2.0
+
+Connectivity and device-support release, porting recent fixes from the python-roborock and ioBroker.roborock upstream projects (see `UpstreamReview-2026-07.md`).
+
+- **New Feature**: Docks introduced since 2025 (Qrevo Curv, Saros 10, Qrevo S5V, Saros 20, and other new dock type codes 10–40) now get their dust-collection, mop-wash, and drying features — including the dock mop-wash switch. Unknown future dock types default to full-featured instead of featureless
+- **New Feature**: Room names now resolve for vacuums shared from another Roborock account (fetched via the device-share rooms API), so Matter room cleaning and the current-room publisher work on shared devices
+- **New Feature**: Qrevo Edge 2 (`a298`) support for clean-mode switching — it uses banded water levels (221–250), so the plugin no longer writes the classic level 202 that the device rejects
+- **Fix (connectivity)**: A vacuum whose IP changed (DHCP) no longer stays unreachable or silently cloud-only until Homebridge restarts — the local reconnect loop now re-queries the device's current IP over the cloud and reconnects to the fresh address; devices demoted to cloud mode after a TCP failure are promoted back to local mode once reachable again
+- **Fix (connectivity)**: The cloud MQTT connection is only reported healthy after the device-topic subscription actually succeeds (broker rejections arrive as qos 128); previously a failed subscription left the plugin claiming a working cloud channel that could never deliver a response
+- **Fix (connectivity)**: Q10-generation (B01 protocol) devices no longer hang startup with a 10-second timeout and stay cloud-only — they are queried with their own `service.get_net_info` method so they can learn their local IP
+- **Fix**: UDP discovery responses were silently discarded due to a missing `this.` in the decryption path; discovery now works again. A UDP port conflict (e.g. ioBroker.roborock on the same host) also no longer aborts all device creation
+- **Fix**: An invalidated cloud session (password change, session revoked) no longer produces an endless 401 retry loop — the cached session is cleared once, polling stops, and the log tells you to re-authenticate. If the 401 is caused by host clock drift (common on NAS hosts), the log instead points at the system time/NTP
+- Licensing note: python-roborock relicensed to Apache 2.0 (2026-07-20), making these ports license-compatible with this MIT plugin
+
+## 2.1.3
+
+Stability release — no new features.
+
+- **Fix (crash)**: A failed Roborock cloud login (wrong credentials, expired session, or the cloud being unreachable) crashed Homebridge with an unhandled rejection during startup. The plugin now logs the error and stays idle instead of sending Homebridge into a crash-restart loop
+- **Hardening**: Platform startup is wrapped so any unexpected initialization error is logged instead of taking down Homebridge
+
+## 2.1.2
+
+Maintenance release — no functional changes.
+
+- **Fix**: Added the standard `name` property to `config.schema.json`. The settings UI already wrote a platform name to the config; it was only missing from the schema (flagged by the Homebridge verification checks)
+
+## 2.1.1
+
+Maintenance release — no functional changes to device control.
+
+- **Improvement**: The plugin settings page now inherits the Homebridge UI theme (theme color and light/dark mode) instead of using its own hard-coded dark palette, so it matches the rest of the Homebridge UI
+- **Fix**: Corrected a malformed `repository` URL in `package.json` (`git+hhttps://…`) that broke the "Repository" link on the NPM package page
+
 ## 2.1.0-wahltho.1
 
 - **Upstream 2.1.0**: Adds a localized, stateful dock mop-wash switch for HAP and Matter, including dock capability detection and corrected `dock_type` processing.
 - **Retained fork fix**: Devices whose local TCP connection remains connected but repeatedly times out fail over to cloud transport for the rest of the plugin session.
 - **Retained fork fix**: Empty room mappings warn once per device until a valid mapping is received.
+
+## 2.1.0
+
+- **New Feature**: Dock mop-wash switch
+  - Vacuums with a washing dock get an extra stateful switch that starts/stops a dock mop wash and mirrors the device's washing state — including washes started from the Roborock app
+  - Available over both HomeKit (extra Switch service on the vacuum accessory) and Matter (bridged on/off accessory per washing-capable vacuum)
+- **New Feature**: `language` config option (settings-page dropdown, default `en`, adds `zh-tw`) for localized device-provided switch names. Changing the language never affects accessory UUIDs or service subtypes, so no re-pairing or room re-selection is needed
+- **Fix**: Dock type detection used the attribute name instead of the actual `dock_type` value
 
 ## 2.0.2-wahltho.1
 

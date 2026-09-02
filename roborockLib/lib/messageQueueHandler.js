@@ -15,7 +15,7 @@ class messageQueueHandler {
 		const mqttConnectionState = this.adapter.rr_mqtt_connector.isConnected();
 		const localConnectionState = this.adapter.localConnector.isConnected(duid);
 
-		let useCloudConnection = remoteConnection || secure || photo || method == "get_network_info";
+		let useCloudConnection = remoteConnection || secure || photo || method == "get_network_info" || method == "service.get_net_info";
 		if (!useCloudConnection && !localConnectionState && mqttConnectionState) {
 			useCloudConnection = true;
 			this.adapter.log.info(`Local connection unavailable for ${duid}. Falling back to cloud connection for method ${method}.`);
@@ -23,7 +23,7 @@ class messageQueueHandler {
 
 		// Some devices (e.g. the Qrevo / roborock.vacuum.a185) keep the local socket
 		// connected but never answer, so the disconnect-based fallback above never
-		// triggers. After repeated local timeouts, prefer cloud for a cooldown window.
+		// triggers. After repeated local timeouts, prefer cloud for this session.
 		if (!useCloudConnection && mqttConnectionState && typeof this.adapter.shouldPreferCloudLocally === "function" && this.adapter.shouldPreferCloudLocally(duid)) {
 			useCloudConnection = true;
 			this.adapter.log.info(`Local connection for ${duid} is unresponsive. Falling back to cloud connection for method ${method}.`);

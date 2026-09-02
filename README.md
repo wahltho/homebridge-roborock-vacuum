@@ -10,6 +10,15 @@ A Homebridge plugin to integrate your Roborock vacuum cleaner with Apple HomeKit
 
 This plugin is inspired by and adapted from the [ioBroker.roborock](https://github.com/copystring/ioBroker.roborock) project by copystring.
 
+## Local fork behavior
+
+The `wahltho` fork follows upstream 2.2.6 and retains two local safeguards:
+
+- After three consecutive unanswered local requests, that device uses cloud transport for the rest of the plugin session. A plugin restart retries local transport. A TCP reconnect alone does not reset this protection, since an open socket does not prove that the device answers requests.
+- An empty room mapping warns once per device until a valid mapping arrives.
+
+Temporary TCP connection failures still use upstream's DHCP-aware reconnect logic and return to local transport when the connection recovers. No configuration or accessory identity changes are required for these safeguards.
+
 ## Features
 
 - **Automatic Device Detection**: No need to manually find or enter your vacuum's device ID.

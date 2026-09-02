@@ -91,7 +91,7 @@ function showToast(type, message) {
   }
 
   const toast = document.createElement("div");
-  toast.className = `toast ${type}`;
+  toast.className = `rr-toast ${type}`;
   toast.textContent = message;
   elements.toastContainer.appendChild(toast);
 
@@ -106,6 +106,20 @@ function showToast(type, message) {
 // leave the page hanging forever.
 const REQUEST_TIMEOUT_MS = 15000;
 
+// Endpoints that round-trip to the Roborock cloud need a bigger budget:
+// 2FA verify and password login each make two sequential cloud requests,
+// which can legitimately exceed 15s on a slow route. Each underlying
+// request is capped at 20s (axios timeout in roborockAuth/roborockHome),
+// so the server always answers — with a real error if the cloud hangs —
+// before this deadline fires.
+const CLOUD_REQUEST_TIMEOUT_MS = 60000;
+const CLOUD_PATHS = [
+  "/auth/login",
+  "/auth/send-2fa-email",
+  "/auth/verify-2fa-code",
+  "/devices/list",
+];
+
 function withTimeout(promise, ms, fallback) {
   return Promise.race([
     promise,
@@ -116,17 +130,16 @@ function withTimeout(promise, ms, fallback) {
 }
 
 async function request(path, body) {
+  const timeoutMs = CLOUD_PATHS.includes(path)
+    ? CLOUD_REQUEST_TIMEOUT_MS
+    : REQUEST_TIMEOUT_MS;
   try {
-    return await withTimeout(
-      window.homebridge.request(path, body),
-      REQUEST_TIMEOUT_MS,
-      {
-        ok: false,
-        message:
-          "The Homebridge UI did not respond in time. " +
-          "Close this window, reload the Homebridge UI page and try again.",
-      }
-    );
+    return await withTimeout(window.homebridge.request(path, body), timeoutMs, {
+      ok: false,
+      message:
+        "The Homebridge UI did not respond in time. " +
+        "Close this window, reload the Homebridge UI page and try again.",
+    });
   } catch (error) {
     return { ok: false, message: error.message || "Request failed." };
   }
@@ -160,9 +173,11 @@ async function loadConfig() {
   if (config.email) {
     elements.email.value = config.email;
   }
-  elements.baseUrl.value = normalizeBaseUrl(
-    config.baseURL || "https://usiot.roborock.com"
-  );
+  // An absent baseURL means auto-detection; keep the auto option selected
+  // instead of forcing the US endpoint.
+  elements.baseUrl.value = config.baseURL
+    ? normalizeBaseUrl(config.baseURL)
+    : "";
   elements.language.value = config.language || "en";
   renderSkipDevices(config.skipDevices);
   matterSelected.clear();
@@ -354,6 +369,7 @@ function addSkipDeviceRow(value = "", shouldFocus = true) {
 
   const input = document.createElement("input");
   input.type = "text";
+  input.className = "form-control";
   input.placeholder = "Device ID";
   input.setAttribute("aria-label", "Skipped device ID");
   input.value = value;
@@ -607,6 +623,7 @@ function renderDiscoveredDevices(devices) {
     label.textContent = `${device.name || device.duid}${model} — ${device.duid}${shared}`;
 
     const select = document.createElement("select");
+    select.className = "form-select form-select-sm";
     const current = currentProtocol(device.duid);
     const options = [{ value: "hap", text: "HomeKit (HAP)" }];
     if (matterSupported || current === "matter") {
@@ -745,7 +762,7 @@ async function saveCredentials() {
 
   await updatePluginConfig({
     email,
-    baseURL,
+    baseURL: baseURL || undefined,
     language: getLanguage(),
     skipDevices,
     matterDevices: matterDevices || undefined,
@@ -766,7 +783,7 @@ async function login() {
     await updatePluginConfig({
       email,
       password,
-      baseURL,
+      baseURL: baseURL || undefined,
       encryptedToken: result.encryptedToken,
     });
     showToast("success", result.message || "Login successful.");
@@ -822,7 +839,7 @@ async function verifyTwoFactorCode() {
   if (result.ok) {
     await updatePluginConfig({
       email,
-      baseURL,
+      baseURL: baseURL || undefined,
       encryptedToken: result.encryptedToken,
     });
     showToast("success", result.message || "Verification successful.");
@@ -905,7 +922,29 @@ async function updatePluginConfig(patch) {
   await withTimeout(window.homebridge.savePluginConfig(), 3000, undefined);
 }
 
+// The Homebridge UI injects its themed stylesheet into this iframe shortly
+// after "ready". Sample the theme's accent from a .primary-text probe once it
+// lands, so native checkboxes follow the user's theme color (--rr-primary in
+// styles.css). Retries because the injected stylesheet arrives asynchronously.
+function adoptThemeAccent(attempt = 0) {
+  const probe = document.createElement("span");
+  probe.className = "primary-text";
+  probe.style.display = "none";
+  document.body.appendChild(probe);
+  const color = getComputedStyle(probe).color;
+  probe.remove();
+
+  if (color && color !== getComputedStyle(document.body).color) {
+    document.documentElement.style.setProperty("--rr-primary", color);
+    return;
+  }
+  if (attempt < 10) {
+    setTimeout(() => adoptThemeAccent(attempt + 1), 300);
+  }
+}
+
 function init() {
+  adoptThemeAccent();
   renderSkipDevices([]);
   loadConfig().catch(() => {
     showToast("error", "Failed to load current config.");

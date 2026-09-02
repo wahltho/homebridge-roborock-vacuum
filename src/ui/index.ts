@@ -33,10 +33,20 @@ interface IHomebridgePluginUiServer {
 
 type HomebridgePluginUiServerConstructor = new () => IHomebridgePluginUiServer;
 
+/** Regional endpoint plus the account's country, resolved per login. */
+interface ResolvedRegion {
+  baseURL: string;
+  country: string;
+  countryCode: string;
+}
+
 class RoborockUiServer {
   private homebridgePluginUiServer: IHomebridgePluginUiServer;
   private homebridgeStoragePath?: string;
   private homebridgeConfigPath?: string;
+  // Discovered regions per account email, kept for the server's lifetime so
+  // one settings-page session only performs discovery once per account.
+  private readonly regionCache = new Map<string, ResolvedRegion>();
 
   constructor(HomebridgePluginUiServer: HomebridgePluginUiServerConstructor) {
     this.homebridgePluginUiServer = new HomebridgePluginUiServer();
@@ -150,6 +160,44 @@ class RoborockUiServer {
     }
   }
 
+  /**
+   * Resolve the account's region. An explicitly chosen baseURL wins;
+   * otherwise the region is discovered from the account email via
+   * getUrlByEmail (cached in-process; failures are not cached so a retry
+   * can succeed) and falls back to the US endpoint like before.
+   */
+  private async resolveRegion(
+    email: string | undefined,
+    baseURL: string | undefined
+  ): Promise<ResolvedRegion> {
+    if (baseURL) {
+      return { baseURL, ...roborockAuth.getRegionConfig(baseURL) };
+    }
+
+    const cacheKey = (email || "").trim().toLowerCase();
+    const cached = this.regionCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const discovered = email
+      ? await roborockAuth.discoverAccountRegion(email)
+      : null;
+    if (discovered) {
+      const guess = roborockAuth.getRegionConfig(discovered.baseURL);
+      const resolved: ResolvedRegion = {
+        baseURL: discovered.baseURL,
+        country: discovered.country || guess.country,
+        countryCode: discovered.countryCode || guess.countryCode,
+      };
+      this.regionCache.set(cacheKey, resolved);
+      return resolved;
+    }
+
+    const fallback = "usiot.roborock.com";
+    return { baseURL: fallback, ...roborockAuth.getRegionConfig(fallback) };
+  }
+
   /** Fetch the account's bridgeable vacuums from the Roborock cloud. */
   private async fetchSupportedDevices(
     email: string | undefined,
@@ -157,8 +205,9 @@ class RoborockUiServer {
     userData: unknown
   ): Promise<unknown[]> {
     const clientID = await this.getClientId();
+    const region = await this.resolveRegion(email, baseURL);
     const devices = await roborockHome.fetchDevices({
-      baseURL: baseURL || "usiot.roborock.com",
+      baseURL: region.baseURL,
       username: email,
       clientID,
       userData,
@@ -237,9 +286,10 @@ class RoborockUiServer {
     }
 
     try {
+      const region = await this.resolveRegion(email, payload.baseURL);
       const loginApi = await this.buildLoginApi({
         email,
-        baseURL: payload.baseURL,
+        baseURL: region.baseURL,
       });
       await roborockAuth.requestEmailCode(loginApi, email);
       return { ok: true, message: "Verification email sent." };
@@ -268,9 +318,12 @@ class RoborockUiServer {
 
     let loginResult;
     try {
+      // The resolved region carries the account's real country/countryCode
+      // when discovery ran; the host-based mapping remains the fallback.
+      const region = await this.resolveRegion(email, payload.baseURL);
       const loginApi = await this.buildLoginApi({
         email,
-        baseURL: payload.baseURL,
+        baseURL: region.baseURL,
       });
       const nonce = this.buildNonce();
       const signData = await roborockAuth.signRequest(loginApi, nonce);
@@ -278,9 +331,6 @@ class RoborockUiServer {
         return { ok: false, message: "Failed to create login signature." };
       }
 
-      const region = roborockAuth.getRegionConfig(
-        payload.baseURL || "usiot.roborock.com"
-      );
       loginResult = await roborockAuth.loginWithCode(loginApi, {
         email,
         code: payload.code,
@@ -325,9 +375,10 @@ class RoborockUiServer {
 
     let loginResult;
     try {
+      const region = await this.resolveRegion(email, payload.baseURL);
       const loginApi = await this.buildLoginApi({
         email,
-        baseURL: payload.baseURL,
+        baseURL: region.baseURL,
       });
       const nonce = this.buildNonce();
       const signData = await roborockAuth.signRequest(loginApi, nonce);
@@ -598,22 +649,15 @@ class RoborockUiServer {
   }
 }
 
-// IMPORTANT: Use Function constructor to create a dynamic import that TypeScript won't transform
-//
-// Background: @homebridge/plugin-ui-utils v2+ is a pure ES module that cannot be loaded with require()
-// in Node.js 18+. Normally we would use `await import('@homebridge/plugin-ui-utils')`, but because
-// this project uses TypeScript with "module": "commonjs" in tsconfig.json, TypeScript transforms
-// dynamic imports into require() calls in the compiled output, which defeats the purpose.
-//
-// Solution: Using the Function constructor prevents TypeScript from transforming the import statement.
-// The Function constructor is evaluated at runtime, so TypeScript cannot statically analyze or transform it.
-// This is the recommended workaround for ES module/CommonJS interop when using TypeScript with CommonJS output.
-//
-// Security note: This is safe because the module specifier is a hardcoded string literal, not user input.
-(async () => {
-  const dynamicImport = new Function("specifier", "return import(specifier)");
-  const { HomebridgePluginUiServer } = await dynamicImport(
-    "@homebridge/plugin-ui-utils"
-  );
+/**
+ * Entry point called by homebridge-ui/server.js. That file stays plain
+ * CommonJS outside the TypeScript build, so it can load the ESM-only
+ * @homebridge/plugin-ui-utils package with a native dynamic import (this
+ * compiled bundle cannot — tsc rewrites dynamic imports for CommonJS
+ * output) and then hands the constructor over.
+ */
+export function startUiServer(
+  HomebridgePluginUiServer: HomebridgePluginUiServerConstructor
+): void {
   new RoborockUiServer(HomebridgePluginUiServer);
-})();
+}

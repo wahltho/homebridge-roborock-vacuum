@@ -13,12 +13,15 @@
 import type { API, Logger } from "homebridge";
 import { MatterStatus } from "homebridge";
 import { BaseMatterAccessory } from "./base_matter_accessory";
+import { RoborockApi } from "./roborock_api";
 
-const MOP_WASHING_STATES = [23, 26];
+// 23 = washing the mop, 25 = its Q7-Max-family alias, 26 = going to wash,
+// 6310 = B01-generation "back at dock washing the duster".
+const MOP_WASHING_STATES = [23, 25, 26, 6310];
 
 export class RoborockDockWashMatterAccessory extends BaseMatterAccessory {
   private readonly duid: string;
-  private readonly roborockAPI: any;
+  private readonly roborockAPI: RoborockApi;
   private currentOn = false;
 
   constructor(
@@ -26,7 +29,7 @@ export class RoborockDockWashMatterAccessory extends BaseMatterAccessory {
     log: Logger,
     device: any,
     displayName: string,
-    roborockAPI: any
+    roborockAPI: RoborockApi
   ) {
     const matter = api.matter;
     if (!matter) {
@@ -43,7 +46,11 @@ export class RoborockDockWashMatterAccessory extends BaseMatterAccessory {
       deviceType: matter.deviceTypes.OnOffOutlet,
       serialNumber: `${device.sn || device.duid}-DW`,
       manufacturer: "Roborock",
-      model: device.productModel || device.model || "Dock",
+      model:
+        roborockAPI.getProductAttribute?.(device.duid, "model") ||
+        device.productModel ||
+        device.model ||
+        "Dock",
       firmwareRevision: device.fv || "1.0.0",
       hardwareRevision: "1.0.0",
       context: {
@@ -102,17 +109,22 @@ export class RoborockDockWashMatterAccessory extends BaseMatterAccessory {
     this.setOn(MOP_WASHING_STATES.includes(Number(data.state)));
   }
 
-  /** Re-read the cached device state (used after registration and on HomeData). */
-  public refreshFromDevice(): void {
+  /**
+   * Re-read the cached device state. The platform passes force=true once
+   * after registration — attribute state restored from the Matter cache can
+   * disagree with the mirror's constructor default — and no force on the
+   * periodic HomeData refresh.
+   */
+  public refreshFromDevice(force = false): void {
     const state = this.roborockAPI.getVacuumDeviceStatus(this.duid, "state");
     if (state === "" || state === undefined || state === null) {
       return;
     }
-    this.setOn(MOP_WASHING_STATES.includes(Number(state)));
+    this.setOn(MOP_WASHING_STATES.includes(Number(state)), force);
   }
 
-  private setOn(on: boolean): void {
-    if (on === this.currentOn) {
+  private setOn(on: boolean, force = false): void {
+    if (on === this.currentOn && !force) {
       return;
     }
     this.currentOn = on;

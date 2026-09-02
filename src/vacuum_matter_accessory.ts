@@ -8,6 +8,7 @@
 import type { API, Logger, MatterRequests } from "homebridge";
 import { MatterStatus } from "homebridge";
 import { BaseMatterAccessory } from "./base_matter_accessory";
+import { RoborockApi } from "./roborock_api";
 
 function getMatterAPI(api: API): NonNullable<API["matter"]> {
   const matter = api.matter;
@@ -45,16 +46,45 @@ const ROBOROCK_STATE_TO_OPERATIONAL_STATE: Record<number, number> = {
   18: 1, // Room Clean → Running
   22: 67, // Emptying dust container → EmptyingDustBin
   23: 68, // Washing the mop → Cleaning mop
+  25: 68, // Washing the mop (Q7 Max family alias) → Cleaning mop
   26: 1, // Going to wash the mop → Running (still driving to the dock)
   28: 0, // In call → Stopped
   29: 1, // Mapping → Running
+  33: 1, // Attaching the mop → Running (mid-run transition)
+  34: 1, // Detaching the mop → Running (mid-run transition)
   100: 66, // Fully Charged → Docked
+  101: 0, // Device offline → Stopped
+  103: 0, // Locked → Stopped
+  // B01/Q10-generation mopping states (python-roborock RoborockStateCode).
+  6301: 1, // Mopping → Running
+  6302: 1, // Clean+mop, vacuum phase → Running
+  6303: 1, // Clean+mop, mop phase → Running
+  6304: 1, // Segment mopping → Running
+  6305: 1, // Segment clean+mop, vacuum phase → Running
+  6306: 1, // Segment clean+mop, mop phase → Running
+  6307: 1, // Zoned mopping → Running
+  6308: 1, // Zoned clean+mop, vacuum phase → Running
+  6309: 1, // Zoned clean+mop, mop phase → Running
+  6310: 68, // Back at dock washing the duster → Cleaning mop
 };
 
 // Roborock states that report the Cleaning run mode (state 29, Mapping, is
 // active motion too — Mapping is not a selectable mode, so it reports as
-// Cleaning).
-const CLEANING_RUN_MODE_STATES = [5, 11, 17, 18, 29];
+// Cleaning). The 63xx entries are the B01/Q10-generation mopping states.
+const CLEANING_RUN_MODE_STATES = [
+  5, 11, 17, 18, 29, 6301, 6302, 6303, 6304, 6305, 6306, 6307, 6308, 6309,
+];
+
+// Status fields mirrored into Matter attributes; refreshFromDevice reads them
+// from the HomeData cache by name (mapped to schema ids by the API).
+const STATUS_FIELDS = [
+  "state",
+  "battery",
+  "charge_status",
+  "fan_power",
+  "water_box_mode",
+  "error_code",
+];
 
 // RvcRunMode mode numbers (stable — controllers persist them).
 const RUN_MODE_IDLE = 0;
@@ -186,7 +216,7 @@ function toMatterArea(room: SegmentRoom) {
 
 export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
   private readonly duid: string;
-  private readonly roborockAPI: any;
+  private readonly roborockAPI: RoborockApi;
   private readonly platformLog: RoborockPlatformLogger;
   private readonly capabilities: CleanModeCapabilities;
   private readonly supportedCleanModes: ReturnType<
@@ -197,6 +227,9 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
   private currentRunMode = RUN_MODE_IDLE;
   private currentErrorCode = 0;
   private currentAreaId: number | null = null;
+  private currentBatPercent?: number;
+  private currentBatChargeLevel?: number;
+  private currentBatChargeState?: number;
   private lastFanPower?: number;
   private lastWaterBoxMode?: number;
   // ServiceArea: rooms known to the controller and the current selection.
@@ -211,9 +244,15 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
     log: Logger,
     platformLog: RoborockPlatformLogger,
     device: any,
-    roborockAPI: any
+    roborockAPI: RoborockApi
   ) {
-    const productModel = device.productModel || device.model || "Unknown";
+    // Home-data device objects carry no model field — the model lives in the
+    // products table, resolved via getProductAttribute (same as the HAP side).
+    const productModel =
+      roborockAPI.getProductAttribute?.(device.duid, "model") ||
+      device.productModel ||
+      device.model ||
+      "Unknown";
     const firmwareVersion = device.fv || "1.0.0";
     const capabilities: CleanModeCapabilities = {
       ...DEFAULT_CLEAN_MODE_CAPABILITIES,
@@ -435,10 +474,8 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
 
     const { fanOff, fanDefault, waterOff, waterDefault, mopSupported } =
       this.capabilities;
-    const status =
-      this.roborockAPI.getVacuumDeviceData(this.duid)?.deviceStatus || {};
-    const fanPower: number | undefined = status.fan_power;
-    const waterBoxMode: number | undefined = status.water_box_mode;
+    const fanPower = this.readStatus("fan_power");
+    const waterBoxMode = this.readStatus("water_box_mode");
     const fanOn =
       fanPower !== undefined && fanPower !== fanOff ? fanPower : fanDefault;
     const waterOn =
@@ -607,6 +644,32 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
   }
 
   /**
+   * Re-seed every status attribute from the HomeData device cache. The raw
+   * cache is keyed by schema id, so fields are read through the API's
+   * name-to-id mapping (getVacuumDeviceStatus). The platform calls this with
+   * force=true once after registration — attribute pushes before registration
+   * are discarded by the Matter server, and attribute state restored from the
+   * Matter cache may be stale — and without force on every HomeData refresh,
+   * the only periodic status source.
+   */
+  public refreshFromDevice(force = false): void {
+    const data: Record<string, number> = {};
+    for (const field of STATUS_FIELDS) {
+      const value = this.readStatus(field);
+      if (value !== undefined) {
+        data[field] = value;
+      }
+    }
+    this.updateFromRoborockData(data, force);
+  }
+
+  /** One status field from the HomeData cache (mapped to its schema id). */
+  private readStatus(field: string): number | undefined {
+    const value = this.roborockAPI.getVacuumDeviceStatus(this.duid, field);
+    return typeof value === "number" ? value : undefined;
+  }
+
+  /**
    * Sync the ServiceArea room list from the Roborock room-mapping cache.
    * Called by the platform whenever device data flows; only pushes to the
    * Matter server when the list actually changed.
@@ -643,16 +706,17 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
   }
 
   /**
-   * Update state from Roborock API data
-   * Called by platform when device state changes
+   * Update state from Roborock API data. Called by the platform when device
+   * state changes; force bypasses the change-detection mirrors so every
+   * present field is published (used for the post-registration seed).
    */
-  public updateFromRoborockData(data: any): void {
+  public updateFromRoborockData(data: any, force = false): void {
     try {
       // Update operational state
       if (data.state !== undefined) {
         const matterState =
           ROBOROCK_STATE_TO_OPERATIONAL_STATE[data.state] ?? 0;
-        if (matterState !== this.currentOperationalState) {
+        if (force || matterState !== this.currentOperationalState) {
           this.currentOperationalState = matterState;
           this.updateState("rvcOperationalState", {
             operationalState: matterState,
@@ -664,7 +728,7 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
 
       // Update the operational error from the Roborock error code.
       if (typeof data.error_code === "number") {
-        this.updateOperationalError(data.error_code);
+        this.updateOperationalError(data.error_code, force);
       }
 
       // Update battery
@@ -681,18 +745,29 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
           batChargeLevel = 1; // Warning
         }
 
-        this.updateState("powerSource", {
-          batPercentRemaining,
-          batChargeLevel,
-        }).catch((err) => this.logError("Failed to update battery:", err));
+        if (
+          force ||
+          batPercentRemaining !== this.currentBatPercent ||
+          batChargeLevel !== this.currentBatChargeLevel
+        ) {
+          this.currentBatPercent = batPercentRemaining;
+          this.currentBatChargeLevel = batChargeLevel;
+          this.updateState("powerSource", {
+            batPercentRemaining,
+            batChargeLevel,
+          }).catch((err) => this.logError("Failed to update battery:", err));
+        }
       }
 
       // Update charging state
       if (data.charge_status !== undefined) {
         const batChargeState = data.charge_status === 0 ? 2 : 1; // 2 = NOT_CHARGING, 1 = CHARGING
-        this.updateState("powerSource", { batChargeState }).catch((err) =>
-          this.logError("Failed to update charge state:", err)
-        );
+        if (force || batChargeState !== this.currentBatChargeState) {
+          this.currentBatChargeState = batChargeState;
+          this.updateState("powerSource", { batChargeState }).catch((err) =>
+            this.logError("Failed to update charge state:", err)
+          );
+        }
       }
 
       // Update clean mode from the motor settings.
@@ -714,7 +789,7 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
         }
 
         if (
-          cleanMode !== this.currentCleanMode &&
+          (force || cleanMode !== this.currentCleanMode) &&
           this.supportedCleanModes.some((mode) => mode.mode === cleanMode)
         ) {
           this.currentCleanMode = cleanMode;
@@ -730,7 +805,7 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
           ? RUN_MODE_CLEANING
           : RUN_MODE_IDLE;
 
-        if (runMode !== this.currentRunMode) {
+        if (force || runMode !== this.currentRunMode) {
           this.currentRunMode = runMode;
           this.updateState("rvcRunMode", { currentMode: runMode }).catch(
             (err) => this.logError("Failed to update run mode:", err)
@@ -752,8 +827,8 @@ export class RoborockVacuumMatterAccessory extends BaseMatterAccessory {
     }
   }
 
-  private updateOperationalError(errorCode: number): void {
-    if (errorCode === this.currentErrorCode) {
+  private updateOperationalError(errorCode: number, force = false): void {
+    if (!force && errorCode === this.currentErrorCode) {
       return;
     }
     this.currentErrorCode = errorCode;

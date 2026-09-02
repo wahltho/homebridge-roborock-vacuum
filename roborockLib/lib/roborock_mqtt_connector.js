@@ -67,26 +67,16 @@ class roborock_mqtt_connector {
       );
     }, 30000);
 
-    await client.on("connect", (result) => {
+    client.on("connect", (result) => {
       if (typeof result != "undefined") {
-        client.subscribe(`rr/m/o/${rriot.u}/${mqttUser}/#`, (err, granted) => {
-          if (err) {
-            this.adapter.catchError(
-              `Failed to subscribe to Roborock MQTT Server! Error: ${err}, granted: ${JSON.stringify(granted)}`,
-              `client.on("connect")`
-            );
-          }
-        });
-        clearTimeout(timeout);
-
-        this.connected = true;
+        this.subscribeAndMarkConnected(timeout, `client.on("connect")`);
       }
       this.adapter.log.debug(
         `MQTT connection connected ${JSON.stringify(result)}.`
       );
     });
 
-    await client.on("error", (result) => {
+    client.on("error", (result) => {
       this.adapter.catchError(
         `MQTT connection error: ${result}`,
         `client.on("error")`
@@ -95,39 +85,54 @@ class roborock_mqtt_connector {
       this.connected = false;
     });
 
-    await client.on("close", () => {
+    client.on("close", () => {
       this.adapter.log.info(`MQTT connection close.`);
 
       this.connected = false;
     });
 
-    await client.on("reconnect", (error) => {
+    client.on("reconnect", (error) => {
       if (error) {
         this.adapter.catchError(
           `Failed to reconnect to MQTT server.`,
           `mqtt client reconnect`
         );
       } else {
-        client.subscribe(`rr/m/o/${rriot.u}/${mqttUser}/#`, (err, granted) => {
-          if (err) {
-            this.adapter.catchError(
-              `Failed to subscribe to Roborock MQTT Server! Error: ${err}, granted: ${JSON.stringify(granted)}`,
-              `client.on("reconnect")`
-            );
-          }
-        });
-        clearTimeout(timeout);
+        this.subscribeAndMarkConnected(timeout, `client.on("reconnect")`);
       }
       this.adapter.log.info(`MQTT connection reconnect.`);
     });
 
-    await client.on("offline", (result) => {
+    client.on("offline", (result) => {
       this.adapter.catchError(
         `MQTT connection offline: ${result}`,
         `client.on("offline")`
       );
 
       this.connected = false;
+    });
+  }
+
+  // The connection only counts as healthy once the device-topic subscription
+  // is granted: a connected broker session with a failed subscribe can never
+  // deliver a response, and reporting it as connected would suppress the
+  // local-connection fallback. Note the broker signals a rejected
+  // subscription via qos 128 in the grant, not via err.
+  subscribeAndMarkConnected(connectTimeout, context) {
+    client.subscribe(`rr/m/o/${rriot.u}/${mqttUser}/#`, (err, granted) => {
+      const rejected = !err && granted && granted[0] && granted[0].qos === 128;
+
+      if (err || rejected) {
+        this.connected = false;
+        this.adapter.catchError(
+          `Failed to subscribe to Roborock MQTT Server! Error: ${err}, granted: ${JSON.stringify(granted)}`,
+          context
+        );
+        return;
+      }
+
+      clearTimeout(connectTimeout);
+      this.connected = true;
     });
   }
 
@@ -224,7 +229,9 @@ class roborock_mqtt_connector {
             this.adapter.log.debug(
               `Cloud message with protocol 102 and id ${dps.id} received. Result: ${JSON.stringify(dps.result)}`
             );
-            this.adapter.setStateAsync("CloudMessage", dps.result);
+            if (this.adapter.deviceNotify) {
+              this.adapter.deviceNotify("CloudMessage", dps.result, duid);
+            }
           } else {
             this.adapter.log.debug(
               `Cloud message with protocol 102 received. Result: ${data.payload}`
@@ -233,7 +240,8 @@ class roborock_mqtt_connector {
             if (this.adapter.deviceNotify !== undefined) {
               this.adapter.deviceNotify(
                 "CloudMessage",
-                JSON.parse(data.payload)
+                JSON.parse(data.payload),
+                duid
               );
             }
           }

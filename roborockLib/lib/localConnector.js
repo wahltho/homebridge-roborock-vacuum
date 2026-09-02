@@ -15,6 +15,9 @@ const BROADCAST_TOKEN = Buffer.from("qWKYcdQWrbm9hPqe", "utf8");
 const MAX_SEGMENT_LENGTH = 8 * 1024 * 1024; // 8 MB per frame
 const MAX_CHUNK_BUFFER = 16 * 1024 * 1024; // 16 MB total buffered
 const RECONNECT_DELAY = 60000;
+// Minimum spacing between cloud-side IP refreshes per device, so the
+// reconnect loop cannot flood the cloud API when a device stays unreachable.
+const IP_REFRESH_MIN_INTERVAL = 60000;
 
 class EnhancedSocket extends net.Socket {
   constructor(options) {
@@ -70,6 +73,7 @@ class localConnector {
     this.localClients = {};
     this.l01HandshakeWaiters = new Map();
     this.reconnectTimeouts = new Map();
+    this.lastIpRefresh = new Map();
     this.shuttingDown = false;
   }
 
@@ -85,6 +89,16 @@ class localConnector {
       client
         .connect(58867, ip, async () => {
           this.adapter.log.debug(`tcp client for ${duid} connected`);
+          // TCP recovery clears temporary failures, but does not prove that a
+          // device previously classified as unresponsive can answer requests.
+          if (
+            this.adapter.remoteDevices.delete(duid) &&
+            !this.adapter.shouldPreferCloudLocally(duid)
+          ) {
+            this.adapter.log.info(
+              `Local connection for ${duid} restored. Switching back from cloud to local mode.`
+            );
+          }
           this.ensureL01Handshake(duid).catch((error) => {
             this.adapter.log.debug(
               `L01 handshake on connect failed for ${duid}: ${error.message}`
@@ -108,6 +122,10 @@ class localConnector {
         this.adapter.remoteDevices.add(duid);
         // this.adapter.catchError(`Failed to create tcp client: ${error.stack}`, `function createClient`, duid);
       }
+      // Keep probing in the background (with a cloud-side IP refresh) so a
+      // device that becomes reachable — or got a new DHCP address — is
+      // promoted back to local mode instead of staying cloud-only forever.
+      this.scheduleReconnect(duid, ip);
     });
 
     client.on("data", async (message) => {
@@ -177,7 +195,7 @@ class localConnector {
                     resolve(result);
 
                     if (this.adapter.deviceNotify !== undefined) {
-                      this.adapter.deviceNotify("LocalMessage", result);
+                      this.adapter.deviceNotify("LocalMessage", result, duid);
                     }
                   }
                 }
@@ -270,9 +288,40 @@ class localConnector {
       duid,
       setTimeout(async () => {
         this.reconnectTimeouts.delete(duid);
-        await this.createClient(duid, ip);
+        // The IP captured at startup goes stale when DHCP hands the device a
+        // new address; re-query it over the cloud before dialing.
+        const refreshedIp = await this.refreshLocalIp(duid);
+        await this.createClient(duid, refreshedIp || ip);
       }, RECONNECT_DELAY)
     );
+  }
+
+  // Re-query the device's current local IP over the cloud channel
+  // (get_network_info updates adapter.localDevices). Rate-limited per device;
+  // returns the freshest known IP or undefined when none is available.
+  async refreshLocalIp(duid) {
+    const now = Date.now();
+    const lastRefresh = this.lastIpRefresh.get(duid) || 0;
+    if (now - lastRefresh >= IP_REFRESH_MIN_INTERVAL) {
+      this.lastIpRefresh.set(duid, now);
+      try {
+        if (
+          this.adapter.hasInitializedVacuum &&
+          this.adapter.hasInitializedVacuum(duid)
+        ) {
+          await this.adapter.vacuums[duid].getParameter(
+            duid,
+            "get_network_info"
+          );
+        }
+      } catch (error) {
+        this.adapter.log.debug(
+          `Cloud IP refresh failed for ${duid}: ${error && error.message}`
+        );
+      }
+    }
+
+    return this.adapter.localDevices[duid];
   }
 
   shutdown() {
@@ -474,11 +523,19 @@ class localConnector {
       });
 
       server.on("error", (error) => {
-        this.adapter.catchError(`Discover server error: ${error.stack}`);
+        // Port 58866 may already be taken by another Roborock integration on
+        // the same host. Discovery is best-effort (get_network_info provides
+        // IPs too), so a bind failure must not abort device creation.
+        this.adapter.log.warn(
+          `UDP discovery unavailable (${error.message}). Continuing without it; local IPs will come from the cloud instead.`
+        );
         closeServer();
+        if (this.localDevicesTimeout) {
+          this.adapter.clearTimeout(this.localDevicesTimeout);
+        }
         if (!settled) {
           settled = true;
-          reject(error);
+          resolve(devices);
         }
       });
 
@@ -498,34 +555,35 @@ class localConnector {
   safeRemovePkcs7(buf) {
     if (!buf || buf.length === 0) return Buffer.alloc(0);
     const pad = buf[buf.length - 1];
-    // 僅在 1..16 且最後 pad 個 byte 都等於 pad 時才移除
+    // Only strip when pad is 1..16 and the last `pad` bytes all equal pad.
     if (pad > 0 && pad <= 16) {
       for (let i = 0; i < pad; i++) {
-        if (buf[buf.length - 1 - i] !== pad) return buf; // padding 形狀不對，視為無 padding
+        if (buf[buf.length - 1 - i] !== pad) return buf; // malformed padding; treat as unpadded
       }
       return buf.slice(0, buf.length - pad);
     }
-    return buf; // 看起來沒有標準 PKCS#7 padding
+    return buf; // no standard PKCS#7 padding present
   }
 
   decryptECB(encrypted, aesKey) {
-    // --- 1) Key/輸入檢查 ---
+    // AES-128 requires a 16-byte key.
     const key = Buffer.isBuffer(aesKey) ? aesKey : Buffer.from(aesKey);
     if (key.length !== 16) {
-      // AES-128 需要 16 bytes 的 key
       return null;
     }
 
     const input = Buffer.isBuffer(encrypted)
       ? encrypted
-      : Buffer.from(encrypted, "latin1"); // "binary" 等同 latin1
+      : Buffer.from(encrypted, "latin1"); // "binary" is an alias of latin1
     if (input.length === 0 || input.length % 16 !== 0) {
-      // 密文長度不是 16 的倍數，多半是封包不完整；丟回 null 讓上層忽略本次
+      // Ciphertext not a multiple of 16 bytes usually means a truncated
+      // packet; return null so the caller ignores this broadcast.
       return null;
     }
 
     try {
-      // --- 2) 固定用 Buffer，關閉自動 padding（你要自己移除） ---
+      // Auto-padding is disabled because the padding is stripped manually
+      // (safeRemovePkcs7 tolerates unpadded payloads).
       const decipher = crypto.createDecipheriv("aes-128-ecb", key, null);
       decipher.setAutoPadding(false);
 
@@ -533,22 +591,14 @@ class localConnector {
         decipher.update(input),
         decipher.final(),
       ]);
-      const unpadded = safeRemovePkcs7(decryptedBuf);
+      const unpadded = this.safeRemovePkcs7(decryptedBuf);
 
-      // 若原協定內容是 UTF-8，這裡再轉字串；否則直接回傳 Buffer 讓上層處理
       return unpadded.toString("utf8");
     } catch (err) {
-      // 例如 wrong final block length、key 不對等情況
-      // 這裡不要讓程式炸掉，直接忽略這個封包
-      // 你也可以在這裡做一次 debug log
-      // console.debug("decryptECB error:", err);
+      // e.g. wrong final block length or a wrong key — a malformed LAN
+      // broadcast must not crash discovery, so just drop the packet.
       return null;
     }
-  }
-
-  removePadding(str) {
-    const paddingLength = str.charCodeAt(str.length - 1);
-    return str.slice(0, -paddingLength);
   }
 
   clearLocalDevicedTimeout() {
