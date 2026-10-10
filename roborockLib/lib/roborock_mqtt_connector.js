@@ -201,6 +201,10 @@ class roborock_mqtt_connector {
           return;
         }
 
+        if (typeof this.adapter.noteCloudMessage === "function") {
+          this.adapter.noteCloudMessage();
+        }
+
         const data = this.adapter.message._decodeMsg(message, duid);
         if (!data) {
           return;
@@ -236,6 +240,10 @@ class roborock_mqtt_connector {
             this.adapter.log.debug(
               `Cloud message with protocol 102 received. Result: ${data.payload}`
             );
+
+            if (typeof this.adapter.recordStatusBroadcast === "function") {
+              this.adapter.recordStatusBroadcast(duid, dps);
+            }
 
             if (this.adapter.deviceNotify !== undefined) {
               this.adapter.deviceNotify(

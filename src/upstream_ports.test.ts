@@ -118,24 +118,30 @@ describe("Roborock.handleApiUnauthorized", () => {
     jest.restoreAllMocks();
   });
 
-  it("ignores errors that are not HTTP 401", () => {
+  it("ignores errors that are not HTTP 401", async () => {
     const api = createApi();
-    expect(api.handleApiUnauthorized(new Error("boom"), "test")).toBe(false);
+    expect(await api.handleApiUnauthorized(new Error("boom"), "test")).toBe(
+      false
+    );
     expect(
-      api.handleApiUnauthorized(
+      await api.handleApiUnauthorized(
         { response: { status: 500, headers: {} } },
         "test"
       )
     ).toBe(false);
   });
 
-  it("clears the session and stops HomeData polling on a session 401", () => {
+  it("clears the session and stops HomeData polling on a session 401", async () => {
     const api = createApi();
     api.deleteStateAsync = jest.fn();
     api.userData = { rriot: {} };
     api.homedataInterval = setInterval(() => {}, 1000000);
+    // The login API confirms the rejection, so this is a revoked session.
+    api.loginApi = {
+      get: jest.fn().mockResolvedValue({ data: { code: 2010 } }),
+    };
 
-    const handled = api.handleApiUnauthorized(
+    const handled = await api.handleApiUnauthorized(
       { response: { status: 401, headers: {} } },
       "updateHomeData"
     );
@@ -147,7 +153,7 @@ describe("Roborock.handleApiUnauthorized", () => {
 
     // Subsequent 401s stay handled without re-clearing anything.
     expect(
-      api.handleApiUnauthorized(
+      await api.handleApiUnauthorized(
         { response: { status: 401, headers: {} } },
         "getScenes"
       )
@@ -155,13 +161,13 @@ describe("Roborock.handleApiUnauthorized", () => {
     expect(api.deleteStateAsync).toHaveBeenCalledTimes(1);
   });
 
-  it("diagnoses clock skew instead of clearing the session", () => {
+  it("diagnoses clock skew instead of clearing the session", async () => {
     const api = createApi();
     api.deleteStateAsync = jest.fn();
     api.userData = { rriot: {} };
 
     const serverDate = new Date(Date.now() + 300 * 1000).toUTCString();
-    const handled = api.handleApiUnauthorized(
+    const handled = await api.handleApiUnauthorized(
       { response: { status: 401, headers: { date: serverDate } } },
       "updateHomeData"
     );
@@ -328,5 +334,229 @@ describe("vacuum.getParameter network info", () => {
       "Devices.d1.networkInfo.ip",
       { val: "10.0.0.6", ack: true }
     );
+  });
+});
+
+describe("roborockAuth user agreement version", () => {
+  const roborockAuth = require("../roborockLib/lib/roborockAuth");
+
+  function createLoginApi(agreement: unknown) {
+    return {
+      get:
+        agreement instanceof Error
+          ? jest.fn().mockRejectedValue(agreement)
+          : jest.fn().mockResolvedValue({ data: agreement }),
+      post: jest.fn().mockResolvedValue({ data: { code: 200, data: {} } }),
+    };
+  }
+
+  function postedParams(loginApi: { post: jest.Mock }) {
+    return new URLSearchParams(loginApi.post.mock.calls[0][1]);
+  }
+
+  it("sends the latest agreement version with a code login", async () => {
+    const loginApi = createLoginApi({
+      code: 200,
+      data: { majorVersion: 16, minorVersion: 1 },
+    });
+
+    await roborockAuth.loginWithCode(loginApi, {
+      email: "a@b.c",
+      code: "123456",
+      country: "US",
+      countryCode: "1",
+      k: "k",
+      s: "s",
+    });
+
+    expect(loginApi.get).toHaveBeenCalledWith("api/v3/app/agreement/latest", {
+      params: { country: "US" },
+      headers: { header_clientlang: "en" },
+    });
+    const params = postedParams(loginApi);
+    expect(params.get("majorVersion")).toBe("16");
+    expect(params.get("minorVersion")).toBe("1");
+  });
+
+  it("sends the latest agreement version with a password login", async () => {
+    const loginApi = createLoginApi({
+      code: 200,
+      data: { majorVersion: 15, minorVersion: 0 },
+    });
+
+    await roborockAuth.loginByPassword(loginApi, {
+      email: "a@b.c",
+      password: "pw",
+      country: "DE",
+      k: "0123456789abcdef",
+      s: "s",
+    });
+
+    expect(loginApi.get.mock.calls[0][1].params).toEqual({ country: "DE" });
+    expect(postedParams(loginApi).get("majorVersion")).toBe("15");
+  });
+
+  it.each([
+    ["the lookup fails", new Error("boom")],
+    ["the answer is not a success", { code: 500, data: null }],
+    ["the version is malformed", { code: 200, data: { majorVersion: "x" } }],
+  ])("falls back to 14.0 when %s", async (_case, agreement) => {
+    const loginApi = createLoginApi(agreement);
+
+    await roborockAuth.loginWithCode(loginApi, {
+      email: "a@b.c",
+      code: "123456",
+      country: "US",
+      countryCode: "1",
+      k: "k",
+      s: "s",
+    });
+
+    const params = postedParams(loginApi);
+    expect(params.get("majorVersion")).toBe("14");
+    expect(params.get("minorVersion")).toBe("0");
+  });
+});
+
+describe("cloud MQTT session health", () => {
+  function createHealthApi() {
+    const api = createApi();
+    api.rr_mqtt_connector = {
+      isConnected: jest.fn(() => true),
+      reconnectClient: jest.fn(),
+    };
+    return api;
+  }
+
+  function timeouts(api: any, count: number) {
+    for (let i = 0; i < count; i++) {
+      api.recordCloudTimeout();
+    }
+  }
+
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  it("restarts a connected session that delivers nothing", () => {
+    const api = createHealthApi();
+    timeouts(api, 2);
+    expect(api.rr_mqtt_connector.reconnectClient).not.toHaveBeenCalled();
+
+    api.recordCloudTimeout();
+    expect(api.rr_mqtt_connector.reconnectClient).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores timeouts while MQTT reports itself disconnected", () => {
+    const api = createHealthApi();
+    api.rr_mqtt_connector.isConnected.mockReturnValue(false);
+    timeouts(api, 5);
+    expect(api.rr_mqtt_connector.reconnectClient).not.toHaveBeenCalled();
+  });
+
+  it("ignores timeouts while the cloud API is unreachable", () => {
+    const api = createHealthApi();
+    api.cloudUnreachable = true;
+    timeouts(api, 5);
+    expect(api.rr_mqtt_connector.reconnectClient).not.toHaveBeenCalled();
+  });
+
+  it("keeps a session that still delivers messages", () => {
+    const api = createHealthApi();
+    timeouts(api, 2);
+    api.noteCloudMessage();
+    timeouts(api, 2);
+    expect(api.rr_mqtt_connector.reconnectClient).not.toHaveBeenCalled();
+  });
+
+  it("backs off exponentially while restarts do not help", () => {
+    jest.useFakeTimers();
+    const api = createHealthApi();
+    const minute = 60 * 1000;
+
+    timeouts(api, 3); // first restart
+    jest.advanceTimersByTime(30 * minute);
+    timeouts(api, 3); // second restart after the 30 min cooldown
+    expect(api.rr_mqtt_connector.reconnectClient).toHaveBeenCalledTimes(2);
+
+    jest.advanceTimersByTime(30 * minute);
+    timeouts(api, 3); // now 60 min are required
+    expect(api.rr_mqtt_connector.reconnectClient).toHaveBeenCalledTimes(2);
+
+    jest.advanceTimersByTime(30 * minute);
+    timeouts(api, 3);
+    expect(api.rr_mqtt_connector.reconnectClient).toHaveBeenCalledTimes(3);
+  });
+
+  it("resets the backoff once messages arrive again", () => {
+    const api = createHealthApi();
+    api.cloudRestartCount = 5;
+    api.noteCloudMessage();
+    expect(api.cloudRestartCooldown()).toBe(30 * 60 * 1000);
+  });
+});
+
+describe("resolveError", () => {
+  const HOME_DATA = {
+    products: [{ id: "p1", model: "roborock.vacuum.a117", schema: [] }],
+    devices: [{ duid: "d1", name: "Vacuum", productId: "p1", pv: "1.0" }],
+    receivedDevices: [],
+  };
+
+  function createResolveApi(status: Record<string, number>) {
+    const api = createApi();
+    api.states["HomeData"] = { val: JSON.stringify(HOME_DATA), ack: true };
+    api.bInited = true;
+    api.vacuums["d1"] = {};
+    api.messageQueueHandler = {
+      sendRequest: jest.fn(async (_duid: string, method: string) =>
+        method === "get_status" ? [status] : ["ok"]
+      ),
+    };
+    return api;
+  }
+
+  function resolveCalls(api: any) {
+    return api.messageQueueHandler.sendRequest.mock.calls.filter(
+      (call: unknown[]) => call[1] === "resolve_error"
+    );
+  }
+
+  it("resolves the dock error first, with dict params", async () => {
+    const api = createResolveApi({ dock_error_status: 38, error_code: 12 });
+
+    expect(await api.resolveError("d1")).toBe(true);
+
+    expect(resolveCalls(api)).toEqual([
+      ["d1", "resolve_error", { error_code: 38 }],
+    ]);
+    // Status is refreshed afterwards.
+    const calls = api.messageQueueHandler.sendRequest.mock.calls;
+    expect(calls[calls.length - 1][1]).toBe("get_status");
+  });
+
+  it("falls back to the robot error", async () => {
+    const api = createResolveApi({ dock_error_status: 0, error_code: 12 });
+    await api.resolveError("d1");
+    expect(resolveCalls(api)[0][2]).toEqual({ error_code: 12 });
+  });
+
+  it("sends nothing when there is no error", async () => {
+    const api = createResolveApi({ dock_error_status: 0, error_code: 0 });
+    expect(await api.resolveError("d1")).toBe(false);
+    expect(resolveCalls(api)).toEqual([]);
+  });
+
+  it("propagates a failed request", async () => {
+    const api = createResolveApi({ error_code: 12 });
+    api.messageQueueHandler.sendRequest.mockImplementation(
+      async (_duid: string, method: string) => {
+        if (method === "resolve_error") {
+          throw new Error("invalid params");
+        }
+        return [{ error_code: 12 }];
+      }
+    );
+    await expect(api.resolveError("d1")).rejects.toThrow("invalid params");
   });
 });

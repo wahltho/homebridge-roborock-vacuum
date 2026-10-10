@@ -18,6 +18,18 @@ const messageQueueHandler =
   require("./lib/messageQueueHandler").messageQueueHandler;
 const mqtt = require("mqtt");
 
+// Schema ids of the status fields in spontaneous status broadcasts
+// (python-roborock RoborockDataProtocol). src/platform.ts translates the
+// same ids for the accessories.
+const DPS_STATUS_FIELDS = {
+  120: "error_code",
+  121: "state",
+  122: "battery",
+  123: "fan_power",
+  124: "water_box_mode",
+  133: "charge_status",
+};
+
 function md5hex(str) {
   return crypto.createHash("md5").update(str).digest("hex");
 }
@@ -119,10 +131,32 @@ class Roborock {
     this.localUnresponsiveDevices = new Set();
     this.localFailoverThreshold = 3;
 
+    // The cloud MQTT session can stay connected while delivering nothing
+    // (python-roborock's HealthManager restarts it for the same reason).
+    // Consecutive cloud request timeouts with no MQTT traffic at all in
+    // between restart the session; see recordCloudTimeout for what does not
+    // count. Restarts back off exponentially until traffic resumes.
+    this.cloudTimeoutStreak = 0;
+    this.cloudRestartThreshold = 3; // silent cloud timeouts before a restart
+    this.cloudRestartBaseCooldown = 30 * 60 * 1000; // 30 min after the first restart
+    this.cloudRestartMaxCooldown = 6 * 60 * 60 * 1000; // backoff cap
+    this.cloudRestartCount = 0; // restarts since MQTT traffic was last seen
+    this.lastCloudRestart = null;
+
+    // Live status reported by the device itself (get_status polls and status
+    // broadcasts), keyed by duid, then by get_status field name:
+    // { value, at }. getVacuumDeviceStatus prefers it over the HomeData
+    // deviceStatus snapshot while fresh — see getLiveStatus.
+    this.liveStatus = new Map();
+
     this.localDevices = {};
     this.remoteDevices = new Set();
 
     this.scenesData = null; // Store scenes data locally
+
+    // Resolved Roborock home id. May start null on a cloud-failed (local-only)
+    // startup; updateHomeData learns it once the cloud is reachable.
+    this.homeId = null;
 
     this.name = "roborock";
     this.deviceNotify = null;
@@ -160,9 +194,23 @@ class Roborock {
     clearTimeout(timeout);
   }
 
+  // State ids that are mirrored to disk so they survive a restart: the cloud
+  // session/client id, and the home data (device list + local keys), its
+  // home id and the devices' last LAN addresses, which let the plugin start
+  // over the LAN when the cloud is down.
+  isPersistedStateId(id) {
+    return (
+      id == "UserData" ||
+      id == "clientID" ||
+      id == "HomeData" ||
+      id == "HomeId" ||
+      id == "LocalDevices"
+    );
+  }
+
   getStateAsync(id) {
     try {
-      if (id == "UserData" || id == "clientID") {
+      if (this.isPersistedStateId(id)) {
         const persistPath = this.getPersistPath(id);
         if (fs.existsSync(persistPath)) {
           return JSON.parse(fs.readFileSync(persistPath, "utf8"));
@@ -180,7 +228,8 @@ class Roborock {
           return legacyState;
         }
 
-        return null;
+        // Fall back to the in-memory copy when nothing is on disk yet.
+        return this.states[id] !== undefined ? this.states[id] : null;
       }
 
       return this.states[id];
@@ -196,10 +245,11 @@ class Roborock {
 
   async setStateAsync(id, state) {
     try {
-      if (id == "UserData" || id == "clientID") {
+      if (this.isPersistedStateId(id)) {
         const persistPath = this.getPersistPath(id);
         fs.mkdirSync(path.dirname(persistPath), { recursive: true });
-        // 0600: UserData contains the cloud token and rriot secrets.
+        // 0600: UserData holds the cloud token/rriot secrets and HomeData
+        // holds per-device localKey secrets.
         fs.writeFileSync(persistPath, JSON.stringify(state, null, 2), {
           encoding: "utf8",
           mode: 0o600,
@@ -219,11 +269,7 @@ class Roborock {
         this.deviceNotify(id, state);
       }
     } catch (error) {
-      if (
-        (id == "UserData" || id == "clientID") &&
-        error &&
-        error.code == "EACCES"
-      ) {
+      if (this.isPersistedStateId(id) && error && error.code == "EACCES") {
         try {
           const fallbackPath = path.join(
             this.forceTemporaryPersistPath(),
@@ -248,6 +294,9 @@ class Roborock {
 
   async deleteStateAsync(id) {
     try {
+      // Only the session files are removed from disk. HomeData, HomeId and
+      // LocalDevices are the offline cache and deliberately survive a failed
+      // login; loadCachedHomeData rejects a cache from another account.
       if (id == "UserData" || id == "clientID") {
         const persistPath = this.getPersistPath(id);
         if (fs.existsSync(persistPath)) {
@@ -459,30 +508,119 @@ class Roborock {
     // api/v1/getUrlByEmail(email = ...)
 
     const userdata = await this.getUserData(this.loginApi);
-    if (!userdata) {
+    if (userdata) {
+      this.setupCloudApi(userdata);
+    } else {
+      // No session (cloud unreachable, or 2FA pending): local control only
+      // needs the cached local keys and IPs, so try the local-only start.
+      // updateHomeData logs in again once the cloud answers.
       this.log.error(
-        "Login failed or requires 2FA. Please complete authentication in the Config UI."
+        "Login failed or requires 2FA. Please complete authentication in the " +
+          "Config UI. Trying to start in local-only mode from the cached " +
+          "device list."
       );
       await this.setStateAsync("info.connection", { val: false, ack: true });
-      return;
+    }
+
+    // Fetch home data (device list + local keys). The cloud is tried first; on
+    // failure we fall back to the last cached copy so the plugin can still
+    // control the vacuums over the LAN while the cloud is unreachable.
+    let homeId = null;
+    let homedataResult = null;
+    let fromCache = false;
+
+    if (userdata) {
+      try {
+        const fetched = await this.fetchHomeDataFromCloud();
+        homeId = fetched.homeId;
+        homedataResult = fetched.homedataResult;
+
+        await this.setStateAsync(
+          "HomeData",
+          this.homeDataState(homedataResult)
+        );
+        if (homeId != null) {
+          await this.setStateAsync("HomeId", { val: homeId, ack: true });
+        }
+      } catch (error) {
+        this.log.error(
+          "Failed to fetch home data from the Roborock cloud: " +
+            (error && error.message ? error.message : error)
+        );
+      }
+    }
+
+    if (!homedataResult) {
+      const cached = this.loadCachedHomeData();
+      if (!cached) {
+        this.log.error(
+          "No cached device data is available, so the plugin cannot start " +
+            "offline. It needs at least one successful online startup to cache " +
+            "the device list and local keys. Staying idle until the Roborock " +
+            "cloud is reachable."
+        );
+        await this.setStateAsync("info.connection", { val: false, ack: true });
+        if (callback) {
+          callback();
+        }
+        return;
+      }
+
+      homedataResult = cached.homedataResult;
+      homeId = cached.homeId;
+      fromCache = true;
+      // The startup error above already said why; keep the periodic refresh
+      // quiet until the cloud answers again.
+      this.cloudUnreachable = true;
+
+      // Publish the cached copy as the live home data. Everything
+      // downstream - the device list, the protocol version used to frame
+      // local messages, and every status read - goes through
+      // getParsedHomeData, which reads this.states. Without this the plugin
+      // would look like it owns no devices and would unregister every
+      // cached accessory.
+      await this.setStateAsync("HomeData", this.homeDataState(homedataResult));
+
+      this.log.warn(
+        "Roborock cloud is unreachable - starting in LOCAL-ONLY mode using " +
+          "the last cached device list. Commands are sent over the LAN; " +
+          "cloud features (scenes, push updates) resume automatically once " +
+          "the cloud is reachable again."
+      );
     }
 
     try {
-      this.loginApi.defaults.headers.common["Authorization"] = userdata.token;
+      await this.initializeFromHomeData(
+        userdata,
+        homedataResult,
+        homeId,
+        fromCache
+      );
     } catch (error) {
       this.log.error(
-        "Failed to login. Most likely wrong token! Deleting HomeData and UserData. Try again! " +
-          error
+        "Failed to initialize devices from home data: " +
+          (error && error.stack ? error.stack : error)
       );
-
-      this.deleteStateAsync("HomeData");
-      this.deleteStateAsync("UserData");
     }
+
+    if (callback) {
+      callback();
+    }
+  }
+
+  // Authorize the login API with the session token and build the Hawk-signed
+  // device API. Runs at startup and again from updateHomeData when a
+  // session-less (local-only) start logs in once the cloud is back.
+  setupCloudApi(userdata) {
+    this.userData = userdata;
+    this.loginApi.defaults.headers.common["Authorization"] = userdata.token;
     const rriot = userdata.rriot;
 
-    // Initialize the real API.
     this.api = axios.create({
       baseURL: rriot.r.a,
+      // Fail instead of hanging when the cloud black-holes connections;
+      // otherwise the periodic refresh piles up requests every interval.
+      timeout: 20000,
     });
     this.api.interceptors.request.use((config) => {
       try {
@@ -518,147 +656,320 @@ class Roborock {
       }
       return config;
     });
+  }
 
-    // Get home details.
+  // Start (or restart) the cloud MQTT client for a session. Any previous
+  // client is closed first so a re-login never leaves a second one
+  // reconnecting in the background.
+  async initCloudMqtt(userdata) {
+    this.rr_mqtt_connector.disconnectClient();
+    await this.rr_mqtt_connector.initUser(userdata);
+    await this.rr_mqtt_connector.initMQTT_Subscribe();
+    await this.rr_mqtt_connector.initMQTT_Message();
+  }
+
+  // Log in again after a session-less (local-only) start. Only network-level
+  // login failures are retried; a rejected login or a pending 2FA is left for
+  // the user. Returns true once the signed API and MQTT client are up.
+  async reconnectCloud() {
+    if (this.loginRetryable === false || !this.config.password) {
+      return false;
+    }
+
+    try {
+      const userdata = await this.getUserData(this.loginApi);
+      if (!userdata) {
+        return false;
+      }
+
+      this.setupCloudApi(userdata);
+      await this.initCloudMqtt(userdata);
+      this.log.info("Logged in to the Roborock cloud again.");
+      return true;
+    } catch (error) {
+      this.log.debug(`Cloud re-login failed: ${error && error.message}`);
+      return false;
+    }
+  }
+
+  // Cloud failures repeat every refresh interval during an outage: log the
+  // first at error level, the rest at debug, and announce the recovery once.
+  logCloudFailure(message) {
+    if (this.cloudUnreachable) {
+      this.log.debug(message);
+      return;
+    }
+
+    this.cloudUnreachable = true;
+    this.log.error(
+      `${message} Further failures are logged at debug level until the cloud answers again.`
+    );
+  }
+
+  noteCloudReachable() {
+    if (this.cloudUnreachable) {
+      this.cloudUnreachable = false;
+      this.log.info(
+        "Roborock cloud is reachable again; resuming cloud features."
+      );
+    }
+  }
+
+  // True when the login API explicitly rejected the session. A degraded cloud
+  // can answer 200 with an empty or non-JSON body; that is not a rejection,
+  // and wiping the session on it would force a password login (possibly with
+  // 2FA) on the next start.
+  isSessionRejection(body) {
+    return !!(body && typeof body.code === "number" && body.code !== 200);
+  }
+
+  // Ask the login API whether the current session is still accepted. Returns
+  // true only on an explicit rejection; an unreachable cloud cannot tell.
+  async isSessionRejected() {
     try {
       const homeDetail = await this.loginApi.get("api/v1/getHomeDetail");
-      if (homeDetail && homeDetail.data && homeDetail.data.data) {
-        const homeId = homeDetail.data.data.rrHomeId;
+      return this.isSessionRejection(homeDetail && homeDetail.data);
+    } catch (error) {
+      return false;
+    }
+  }
 
-        if (this.api) {
-          const homedata = await this.api.get(`v2/user/homes/${homeId}`);
-          const homedataResult = homedata.data.result;
-
-          await this.setStateAsync("HomeData", {
-            val: JSON.stringify(homedataResult),
-            ack: true,
-          });
-
-          // skip devices whose serial number or device ID is in ignoredDevices or skipDevices
-          const ignoredDevices = this.config.ignoredDevices || [];
-          const skipDevices = this.parseSkipDevices(this.config.skipDevices);
-          const ignoredSet = new Set([...ignoredDevices, ...skipDevices]);
-          // create devices and set states
-          this.products = homedataResult.products;
-          this.devices = homedataResult.devices || [];
-          this.devices = this.devices.filter(
-            (device) =>
-              !ignoredSet.has(device.sn) && !ignoredSet.has(device.duid)
-          );
-          this.receivedDevices = (homedataResult.receivedDevices || []).filter(
-            (device) =>
-              !ignoredSet.has(device.sn) && !ignoredSet.has(device.duid)
-          );
-
-          const allManagedDevices = (homedataResult.devices || []).concat(
-            homedataResult.receivedDevices || []
-          );
-          const localKeyDevices = [];
-          for (const device of allManagedDevices) {
-            if (!device || !device.duid) {
-              continue;
-            }
-
-            if (
-              (device.sn && ignoredSet.has(device.sn)) ||
-              (device.duid && ignoredSet.has(device.duid))
-            ) {
-              continue;
-            }
-
-            if (!device.localKey) {
-              this.log.warn(
-                `Device ${device.duid} (product ${device.productId || "unknown"}) has no localKey in home data and cannot be controlled. Fields returned by the API: ${Object.keys(device).join(", ")}`
-              );
-              continue;
-            }
-
-            localKeyDevices.push(device);
-          }
-
-          this.localKeys = new Map(
-            localKeyDevices.map((device) => [device.duid, device.localKey])
-          );
-
-          // this.adapter.log.debug(`initUser test: ${JSON.stringify(Array.from(this.adapter.localKeys.entries()))}`);
-
-          await this.rr_mqtt_connector.initUser(userdata);
-          await this.rr_mqtt_connector.initMQTT_Subscribe();
-          await this.rr_mqtt_connector.initMQTT_Message();
-
-          // store name of each room via ID
-          const rooms = homedataResult.rooms;
-          for (const room in rooms) {
-            const roomID = rooms[room].id;
-            const roomName = rooms[room].name;
-
-            this.roomIDs[roomID] = roomName;
-          }
-
-          await this.loadSharedDeviceRooms();
-          this.log.debug(`RoomIDs debug: ${JSON.stringify(this.roomIDs)}`);
-
-          // reconnect every 3 hours (10800 seconds)
-          this.reconnectIntervall = this.setInterval(async () => {
-            this.log.debug(`Reconnecting after 3 hours!`);
-
-            await this.rr_mqtt_connector.reconnectClient();
-          }, 10800 * 1000);
-
-          this.homedataInterval = this.setInterval(
-            this.updateHomeData.bind(this),
-            this.updateInterval * 1000,
-            homeId
-          );
-          await this.updateHomeData(homeId);
-
-          const discoveredDevices = await this.localConnector.getLocalDevices();
-
-          await this.createDevices();
-          await this.getNetworkInfo();
-
-          // merge udp discovered devices with local devices found via mqtt
-          Object.entries(discoveredDevices).forEach(([duid, ip]) => {
-            if (
-              !Object.prototype.hasOwnProperty.call(this.localDevices, duid)
-            ) {
-              this.localDevices[duid] = ip;
-            }
-          });
-          this.log.debug(`localDevices: ${JSON.stringify(this.localDevices)}`);
-
-          for (const device in this.localDevices) {
-            const duid = device;
-            const ip = this.localDevices[device];
-
-            await this.localConnector.createClient(duid, ip);
-          }
-
-          await this.initializeDeviceUpdates();
-          this.bInited = true;
-          this.log.info(`Starting adapter finished. Lets go!!!!!!!`);
-        } else {
-          this.log.info(
-            `Most likely failed to login. Deleting UserData to force new login!`
-          );
-          await this.deleteStateAsync(`UserData`);
-        }
-      } else {
+  // Fetch the account's home data from the cloud. Throws on any failure
+  // (network, timeout, or an unusable response) so the caller can fall back to
+  // the cached copy. Only an explicit rejection clears the cached session so
+  // the next startup re-logs in.
+  async fetchHomeDataFromCloud() {
+    const homeDetail = await this.loginApi.get("api/v1/getHomeDetail");
+    const body = homeDetail && homeDetail.data;
+    if (!(body && body.data)) {
+      if (this.isSessionRejection(body)) {
         this.log.warn(
-          "The stored Roborock session is invalid or expired. " +
-            "Deleting cached UserData to force a new login. " +
-            "Please re-authenticate in the plugin settings if this persists."
+          `The stored Roborock session was rejected (code ${body.code}: ${body.msg || "no message"}). ` +
+            "Clearing it so the next startup re-authenticates."
         );
         this.userData = null;
-        await this.deleteStateAsync(`UserData`);
+        await this.deleteStateAsync("UserData");
+        throw new Error(
+          `getHomeDetail rejected the session (code ${body.code})`
+        );
       }
-    } catch (error) {
-      this.log.error("Failed to get home details: " + error.stack);
+      throw new Error("getHomeDetail returned no usable data");
     }
 
-    if (callback) {
-      callback();
+    const homeId = body.data.rrHomeId;
+
+    if (!this.api) {
+      throw new Error("Signed cloud API is not initialized");
     }
+
+    const homedata = await this.api.get(`v2/user/homes/${homeId}`);
+    const homedataResult = homedata && homedata.data && homedata.data.result;
+    if (!homedataResult) {
+      throw new Error("home data response was empty");
+    }
+
+    return { homeId, homedataResult };
+  }
+
+  // HomeData state as stored: tagged with the account it belongs to, so a
+  // cache left behind by a previous account is never used for a local-only
+  // start.
+  homeDataState(homedataResult) {
+    return {
+      val: JSON.stringify(homedataResult),
+      ack: true,
+      account: this.config.username,
+    };
+  }
+
+  // Load the last home data cached on disk (written on every successful cloud
+  // fetch). Returns { homeId, homedataResult } or null when nothing is cached.
+  loadCachedHomeData() {
+    try {
+      const cached = this.getStateAsync("HomeData");
+      const raw = cached && typeof cached.val === "string" ? cached.val : null;
+      if (!raw) {
+        return null;
+      }
+
+      if (cached.account && cached.account !== this.config.username) {
+        this.log.warn(
+          `Ignoring cached device data: it belongs to ${cached.account}, not ${this.config.username}.`
+        );
+        return null;
+      }
+
+      const homedataResult = JSON.parse(raw);
+      if (!homedataResult) {
+        return null;
+      }
+
+      const cachedHomeId = this.getStateAsync("HomeId");
+      const homeId =
+        cachedHomeId && cachedHomeId.val != null ? cachedHomeId.val : null;
+
+      return { homeId, homedataResult };
+    } catch (error) {
+      this.log.debug(
+        `Failed to read cached home data: ${error && error.message}`
+      );
+      return null;
+    }
+  }
+
+  // Last known LAN address per device, so a local-only start can dial the
+  // vacuums even when UDP discovery finds nothing (other VLAN, port 58866
+  // taken by another integration) and get_network_info needs the cloud.
+  loadCachedLocalDevices() {
+    const cached = this.getStateAsync("LocalDevices");
+    return cached && cached.val && typeof cached.val === "object"
+      ? cached.val
+      : {};
+  }
+
+  persistLocalDevices() {
+    if (Object.keys(this.localDevices).length === 0) {
+      return; // never replace a useful cache with nothing
+    }
+
+    return this.setStateAsync("LocalDevices", {
+      val: this.localDevices,
+      ack: true,
+    });
+  }
+
+  // Build the device list, local keys, MQTT/local connections and polling from
+  // home data - shared by the online path (fresh cloud data) and the
+  // local-only path (cached data). The cloud MQTT client and the home-data
+  // refresh interval are set up in both cases so cloud features recover on
+  // their own once the cloud is reachable again.
+  async initializeFromHomeData(userdata, homedataResult, homeId, fromCache) {
+    if (homeId != null) {
+      this.homeId = homeId;
+    }
+
+    // skip devices whose serial number or device ID is in ignoredDevices or skipDevices
+    const ignoredDevices = this.config.ignoredDevices || [];
+    const skipDevices = this.parseSkipDevices(this.config.skipDevices);
+    const ignoredSet = new Set([...ignoredDevices, ...skipDevices]);
+    // create devices and set states
+    this.products = homedataResult.products;
+    this.devices = homedataResult.devices || [];
+    this.devices = this.devices.filter(
+      (device) => !ignoredSet.has(device.sn) && !ignoredSet.has(device.duid)
+    );
+    this.receivedDevices = (homedataResult.receivedDevices || []).filter(
+      (device) => !ignoredSet.has(device.sn) && !ignoredSet.has(device.duid)
+    );
+
+    const allManagedDevices = (homedataResult.devices || []).concat(
+      homedataResult.receivedDevices || []
+    );
+    const localKeyDevices = [];
+    for (const device of allManagedDevices) {
+      if (!device || !device.duid) {
+        continue;
+      }
+
+      if (
+        (device.sn && ignoredSet.has(device.sn)) ||
+        (device.duid && ignoredSet.has(device.duid))
+      ) {
+        continue;
+      }
+
+      if (!device.localKey) {
+        this.log.warn(
+          `Device ${device.duid} (product ${device.productId || "unknown"}) has no localKey in home data and cannot be controlled. Fields returned by the API: ${Object.keys(device).join(", ")}`
+        );
+        continue;
+      }
+
+      localKeyDevices.push(device);
+    }
+
+    this.localKeys = new Map(
+      localKeyDevices.map((device) => [device.duid, device.localKey])
+    );
+
+    // The cloud MQTT client is initialised from the (cached) session even in
+    // local-only mode: it keeps retrying in the background, so the cloud path
+    // and push updates recover on their own once the broker is reachable.
+    // Without a session, reconnectCloud brings it up after the re-login.
+    if (userdata) {
+      await this.initCloudMqtt(userdata);
+    }
+
+    // store name of each room via ID
+    const rooms = homedataResult.rooms;
+    for (const room in rooms) {
+      const roomID = rooms[room].id;
+      const roomName = rooms[room].name;
+
+      this.roomIDs[roomID] = roomName;
+    }
+
+    await this.loadSharedDeviceRooms();
+    this.log.debug(`RoomIDs debug: ${JSON.stringify(this.roomIDs)}`);
+
+    // reconnect every 3 hours (10800 seconds)
+    this.reconnectIntervall = this.setInterval(async () => {
+      this.log.debug(`Reconnecting after 3 hours!`);
+
+      await this.rr_mqtt_connector.reconnectClient();
+    }, 10800 * 1000);
+
+    // Periodic home-data refresh. It also drives cloud recovery: on a
+    // local-only start (no homeId yet) updateHomeData learns it via
+    // getHomeDetail before refreshing.
+    this.homedataInterval = this.setInterval(
+      () => this.updateHomeData(this.homeId),
+      this.updateInterval * 1000
+    );
+    // A fresh online start pulls once more to load scenes and reconcile
+    // intervals. In local-only mode the cloud is down, so defer to the interval
+    // instead of blocking startup on a call that will fail.
+    if (!fromCache) {
+      await this.updateHomeData(this.homeId);
+    }
+
+    const discoveredDevices = await this.localConnector.getLocalDevices();
+
+    await this.createDevices();
+    await this.getNetworkInfo();
+
+    // merge udp discovered devices with local devices found via mqtt
+    Object.entries(discoveredDevices).forEach(([duid, ip]) => {
+      if (!Object.prototype.hasOwnProperty.call(this.localDevices, duid)) {
+        this.localDevices[duid] = ip;
+      }
+    });
+
+    // Devices that answered neither the UDP broadcast nor (cloud down) the
+    // get_network_info request: dial the address they had last time. A stale
+    // one just fails to connect and goes through the usual reconnect loop.
+    for (const [duid, ip] of Object.entries(this.loadCachedLocalDevices())) {
+      if (!this.localDevices[duid] && this.localKeys.has(duid)) {
+        this.localDevices[duid] = ip;
+      }
+    }
+    await this.persistLocalDevices();
+    this.log.debug(`localDevices: ${JSON.stringify(this.localDevices)}`);
+
+    for (const device in this.localDevices) {
+      const duid = device;
+      const ip = this.localDevices[device];
+
+      await this.localConnector.createClient(duid, ip);
+    }
+
+    await this.initializeDeviceUpdates();
+    this.bInited = true;
+    this.log.info(
+      fromCache
+        ? "Starting adapter finished in local-only mode (cloud unreachable)."
+        : "Starting adapter finished. Lets go!!!!!!!"
+    );
   }
 
   async stopService() {
@@ -693,6 +1004,7 @@ class Roborock {
 
       if (!this.config.password) {
         this.log.error("Password is missing and no valid token is available.");
+        this.loginRetryable = false;
         return null;
       }
 
@@ -704,6 +1016,7 @@ class Roborock {
       const loginResult = await roborockAuth.loginByPassword(loginApi, {
         email: this.config.username,
         password: this.config.password,
+        country: this.getLoginRegion().country,
         k: signData.k,
         s: signData.s,
       });
@@ -723,6 +1036,7 @@ class Roborock {
       if (loginResult && loginResult.code === 2031) {
         this.authState.twoFactorRequired = true;
         this.authState.statusMessage = "Two-factor authentication required.";
+        this.loginRetryable = false;
         this.log.error(
           "Two-factor authentication required. Use the Config UI to continue."
         );
@@ -734,8 +1048,20 @@ class Roborock {
       // Failed logins (bad credentials, unreachable cloud) are expected
       // runtime conditions — report "no user data" so startService aborts
       // gracefully instead of crashing Homebridge with an unhandled
-      // rejection.
-      this.log.error(`Error in getUserData: ${error.message}`);
+      // rejection. Only a network-level failure (no HTTP answer, or a server
+      // error) may be retried automatically by reconnectCloud; a rejected
+      // login must never be repeated every interval.
+      this.loginRetryable = !!(
+        error &&
+        error.isAxiosError &&
+        (!error.response || error.response.status >= 500)
+      );
+      if (this.loginRetryable) {
+        // Repeats every refresh interval while the cloud is down.
+        this.logCloudFailure(`Error in getUserData: ${error.message}.`);
+      } else {
+        this.log.error(`Error in getUserData: ${error.message}`);
+      }
       await this.deleteStateAsync("HomeData");
       await this.deleteStateAsync("UserData");
       return null;
@@ -786,6 +1112,20 @@ class Roborock {
     return { ok: true };
   }
 
+  // Country and country code sent with a login. The discovered region carries
+  // the account's real ones; the host-based mapping is only a guess (e.g.
+  // every euiot account maps to DE/49) and stays as the fallback.
+  getLoginRegion() {
+    const guess = roborockAuth.getRegionConfig(this.baseURL);
+    return {
+      country:
+        (this.accountRegion && this.accountRegion.country) || guess.country,
+      countryCode:
+        (this.accountRegion && this.accountRegion.countryCode) ||
+        guess.countryCode,
+    };
+  }
+
   async verifyTwoFactorCode(code) {
     if (!this.loginApi) {
       throw new Error("Login API is not initialized.");
@@ -796,17 +1136,7 @@ class Roborock {
       throw new Error("Missing login signature.");
     }
 
-    // The discovered region carries the account's real country/countryCode;
-    // the host-based mapping is only a guess (e.g. every euiot account maps
-    // to DE/49) and stays as the fallback.
-    const guess = roborockAuth.getRegionConfig(this.baseURL);
-    const region = {
-      country:
-        (this.accountRegion && this.accountRegion.country) || guess.country,
-      countryCode:
-        (this.accountRegion && this.accountRegion.countryCode) ||
-        guess.countryCode,
-    };
+    const region = this.getLoginRegion();
     const loginResult = await roborockAuth.loginWithCode(this.loginApi, {
       email: this.config.username,
       code,
@@ -892,8 +1222,10 @@ class Roborock {
 
       const robotModel = this.getProductAttribute(duid, "model");
 
-      if (device.online) {
-        this.log.debug(`${duid} online. Starting update intervals.`);
+      // onlineChecker also reports a locally connected device as reachable, so
+      // polling still runs for LAN-reachable devices during a cloud outage.
+      if (await this.onlineChecker(duid)) {
+        this.log.debug(`${duid} reachable. Starting update intervals.`);
         this.startDeviceIntervals(duid);
       }
 
@@ -963,7 +1295,7 @@ class Roborock {
       try {
         await this.api.post(`user/scene/${sceneID.val}/execute`);
       } catch (error) {
-        if (!this.handleApiUnauthorized(error, "executeScene")) {
+        if (!(await this.handleApiUnauthorized(error, "executeScene"))) {
           this.catchError(error.stack, "executeScene");
         }
       }
@@ -977,6 +1309,10 @@ class Roborock {
   async getHomeID() {
     if (!this.loginApi) {
       throw new Error("loginApi is not initialized. Call init() first.");
+    }
+
+    if (this.homeId != null) {
+      return this.homeId; // resolved at startup; no cloud round trip needed
     }
 
     try {
@@ -1012,7 +1348,7 @@ class Roborock {
 
       return response.data;
     } catch (error) {
-      if (!this.handleApiUnauthorized(error, "getScenes")) {
+      if (!(await this.handleApiUnauthorized(error, "getScenes"))) {
         this.log.error(`Failed to get scenes: ${error.message}`);
       }
       throw error;
@@ -1094,7 +1430,28 @@ class Roborock {
     return product ? product[attribute] : null;
   }
 
+  // Whether the per-device local TCP client is currently connected.
+  isLocallyConnected(duid) {
+    try {
+      return !!(
+        this.localConnector &&
+        typeof this.localConnector.isConnected === "function" &&
+        this.localConnector.isConnected(duid)
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
   async onlineChecker(duid) {
+    // A device we hold a live local connection to is reachable regardless of
+    // the cached cloud online flag, which is stale (and may be false) while the
+    // cloud is unreachable. Trusting the live socket is what keeps local
+    // commands from being rejected during a cloud outage.
+    if (this.isLocallyConnected(duid)) {
+      return true;
+    }
+
     const homedata = this.getParsedHomeData();
     if (!homedata) {
       return false;
@@ -1133,6 +1490,10 @@ class Roborock {
   // Query them per shared device and merge into roomIDs. Room entries carry
   // their id as either `id` or `roomId` depending on the backend.
   async loadSharedDeviceRooms() {
+    if (!this.api) {
+      return; // session-less local-only start: shared devices are cloud-only
+    }
+
     for (const device of this.receivedDevices || []) {
       try {
         const response = await this.api.get(
@@ -1200,6 +1561,8 @@ class Roborock {
     this.log.debug(`Latest data requested`);
 
     if (this.isSupportedVacuumModel(robotModel)) {
+      await this.pollStatus(duid);
+
       await vacuum.getParameter(duid, "get_room_mapping");
 
       await vacuum.getParameter(duid, "get_consumable");
@@ -1285,35 +1648,67 @@ class Roborock {
   }
 
   async updateHomeData(homeId) {
-    this.log.debug(`Updating HomeData with homeId: ${homeId}`);
-    if (this.api) {
+    // Cloud recovery for a session-less (local-only) start: nothing
+    // cloud-side works until a login succeeds, so retry that first.
+    if (!this.api && !(await this.reconnectCloud())) {
+      return;
+    }
+
+    if (homeId == null) {
+      homeId = this.homeId;
+    }
+
+    // Cloud recovery: a local-only start may have no home id yet. Learn it
+    // from getHomeDetail before refreshing, so cloud features resume without
+    // a Homebridge restart. While the cloud is still down this just retries
+    // on the next tick.
+    if (homeId == null) {
       try {
-        const home = await this.api.get(`user/homes/${homeId}`);
-        const homedata = home.data.result;
-
-        if (homedata) {
-          await this.setStateAsync("HomeData", {
-            val: JSON.stringify(homedata),
-            ack: true,
-          });
-          this.log.debug(`homedata successfully updated`);
-
-          await this.getScenes();
-
-          // Fresh online flags just arrived: stop polling devices that went
-          // offline and resume devices that came back (both idempotent).
-          for (const duid of this.initializedVacuumDuids) {
-            await this.manageDeviceIntervals(duid);
-          }
-        } else {
-          this.log.warn("homedata failed to download");
-        }
+        const homeDetail = await this.loginApi.get("api/v1/getHomeDetail");
+        homeId =
+          homeDetail && homeDetail.data && homeDetail.data.data
+            ? homeDetail.data.data.rrHomeId
+            : null;
       } catch (error) {
-        if (!this.handleApiUnauthorized(error, "updateHomeData")) {
-          this.log.error(
-            `Failed to update updateHomeData with error: ${error}`
-          );
+        this.log.debug(
+          `Home id still unavailable (cloud likely still down): ${error && error.message}`
+        );
+        return;
+      }
+
+      if (homeId == null) {
+        return;
+      }
+
+      this.homeId = homeId;
+      await this.setStateAsync("HomeId", { val: homeId, ack: true });
+    }
+
+    this.log.debug(`Updating HomeData with homeId: ${homeId}`);
+    try {
+      const home = await this.api.get(`user/homes/${homeId}`);
+      const homedata = home.data.result;
+
+      if (homedata) {
+        await this.setStateAsync("HomeData", this.homeDataState(homedata));
+        this.log.debug(`homedata successfully updated`);
+        this.noteCloudReachable();
+
+        await this.getScenes();
+
+        // Fresh online flags just arrived: stop polling devices that went
+        // offline and resume devices that came back (both idempotent).
+        for (const duid of this.initializedVacuumDuids) {
+          await this.manageDeviceIntervals(duid);
         }
+      } else {
+        this.log.warn("homedata failed to download");
+      }
+    } catch (error) {
+      if (!(await this.handleApiUnauthorized(error, "updateHomeData"))) {
+        this.logCloudFailure(
+          `Failed to update updateHomeData with error: ${error}.`
+        );
       }
     }
   }
@@ -1329,7 +1724,7 @@ class Roborock {
    *   HomeData polling stops until the user re-authenticates.
    * Returns true when the error was a 401 and has been handled here.
    */
-  handleApiUnauthorized(error, context) {
+  async handleApiUnauthorized(error, context) {
     if (!error || !error.response || error.response.status !== 401) {
       return false;
     }
@@ -1357,6 +1752,17 @@ class Roborock {
     }
 
     if (this.sessionInvalidated) {
+      return true;
+    }
+
+    // A 401 from the signed API normally means a revoked session, but a
+    // degraded cloud can produce one too. Ask the login API before throwing
+    // the session away; while it still accepts the token (or cannot be
+    // reached) the request simply retries on the next interval.
+    if (!(await this.isSessionRejected())) {
+      this.logCloudFailure(
+        `Roborock API rejected the request (401) in ${context}, but the login API still accepts the session. Keeping it and retrying later.`
+      );
       return true;
     }
     this.sessionInvalidated = true;
@@ -1676,7 +2082,64 @@ class Roborock {
     }
   }
 
+  // Called by the message queue when a CLOUD request times out. Only a
+  // session that claims to be connected yet delivers nothing is restarted:
+  // - while MQTT reports itself disconnected (network down, broker gone) the
+  //   mqtt client's own reconnect loop is already at work;
+  // - while the Roborock cloud API is unreachable the outage is server-side
+  //   and a new session would not help;
+  // - any MQTT message (see noteCloudMessage) resets the streak, so requests
+  //   one device leaves unanswered never restart a session that works.
+  recordCloudTimeout() {
+    if (!this.rr_mqtt_connector.isConnected() || this.cloudUnreachable) {
+      return;
+    }
+
+    this.cloudTimeoutStreak++;
+    if (this.cloudTimeoutStreak < this.cloudRestartThreshold) {
+      return;
+    }
+
+    const now = Date.now();
+    if (
+      this.lastCloudRestart !== null &&
+      now - this.lastCloudRestart < this.cloudRestartCooldown()
+    ) {
+      return;
+    }
+
+    this.log.info(
+      `Cloud MQTT session delivered nothing for ${this.cloudTimeoutStreak} consecutive requests; restarting it.`
+    );
+    this.lastCloudRestart = now;
+    this.cloudRestartCount++;
+    this.cloudTimeoutStreak = 0;
+    this.rr_mqtt_connector.reconnectClient();
+  }
+
+  // Minimum time since the last restart before the next one: 30 min, doubled
+  // for every further restart that did not bring traffic back, up to 6 h.
+  cloudRestartCooldown() {
+    const exponent = Math.max(0, this.cloudRestartCount - 1);
+    return Math.min(
+      this.cloudRestartBaseCooldown * 2 ** exponent,
+      this.cloudRestartMaxCooldown
+    );
+  }
+
+  // Called for every MQTT message received: the session is delivering.
+  noteCloudMessage() {
+    this.cloudTimeoutStreak = 0;
+    this.cloudRestartCount = 0;
+  }
+
+  // Called by the message queue when a CLOUD request succeeds.
+  recordCloudSuccess() {
+    this.noteCloudMessage();
+  }
+
   // Called by the message queue when a LOCAL request succeeds before failover.
+  // Session-wide failover remains active until the plugin restarts.
   recordLocalSuccess(duid) {
     if (!duid) {
       return;
@@ -1984,7 +2447,123 @@ class Roborock {
     }
   }
 
+  // Poll get_status, the device's own status report. V1 devices only (B01
+  // devices use a different method set). The HomeData deviceStatus snapshot
+  // is a cloud-side copy that can lag behind the device, and older products'
+  // schemas lack fields such as charge_status. python-roborock polls
+  // get_status for V1 status as well.
+  async pollStatus(duid) {
+    if (this.getVacuumDeviceInfo(duid, "pv") !== "1.0") {
+      return;
+    }
+
+    if (!this.shouldPollMethod(duid, "get_status")) {
+      this.log.debug(
+        `Skipping get_status for ${duid}; backing off after repeated timeouts.`
+      );
+      return;
+    }
+
+    try {
+      const result = await this.messageQueueHandler.sendRequest(
+        duid,
+        "get_status",
+        []
+      );
+      this.recordLiveStatus(duid, Array.isArray(result) ? result[0] : result);
+    } catch (error) {
+      this.catchError(error, "get_status", duid);
+    }
+  }
+
+  // Resolve an error, like tapping "Resolved" in the Roborock app. Some
+  // errors (dock errors such as water_empty) stay latched until resolved,
+  // even after the cause is fixed. Without an explicit code this resolves
+  // the current dock error, falling back to the robot error, and sends
+  // nothing when neither is set. Returns whether a resolve was sent; throws
+  // when the request fails. Mirrors python-roborock (the firmware rejects
+  // array params, so the code goes in a dict).
+  async resolveError(duid, errorCode) {
+    if (!this.isInited()) {
+      throw new Error("Adapter not inited.");
+    }
+    if (!this.vacuums[duid]) {
+      throw new Error(`resolve_error: unknown device ${duid}.`);
+    }
+    if (this.getVacuumDeviceInfo(duid, "pv") !== "1.0") {
+      throw new Error(`resolve_error is not supported by device ${duid}.`);
+    }
+
+    if (errorCode === undefined) {
+      await this.pollStatus(duid);
+      errorCode =
+        Number(this.getVacuumDeviceStatus(duid, "dock_error_status")) ||
+        Number(this.getVacuumDeviceStatus(duid, "error_code")) ||
+        0;
+      if (!errorCode) {
+        this.log.info(`No error to resolve on ${duid}.`);
+        return false;
+      }
+    }
+
+    this.log.info(`Resolving error ${errorCode} on ${duid}.`);
+    await this.messageQueueHandler.sendRequest(duid, "resolve_error", {
+      error_code: errorCode,
+    });
+    await this.pollStatus(duid);
+    return true;
+  }
+
+  // Record named status fields (a get_status result) as live status.
+  recordLiveStatus(duid, status) {
+    if (!duid || !status || typeof status !== "object") {
+      return;
+    }
+
+    const now = Date.now();
+    const fields = this.liveStatus.get(duid) || {};
+    for (const [field, value] of Object.entries(status)) {
+      if (typeof value === "number") {
+        fields[field] = { value, at: now };
+      }
+    }
+    this.liveStatus.set(duid, fields);
+  }
+
+  // Record a status broadcast, which carries schema ids instead of get_status
+  // field names (python-roborock RoborockDataProtocol).
+  recordStatusBroadcast(duid, dps) {
+    if (!dps || typeof dps !== "object") {
+      return;
+    }
+
+    const status = {};
+    for (const [dpsId, field] of Object.entries(DPS_STATUS_FIELDS)) {
+      if (dps[dpsId] !== undefined) {
+        status[field] = dps[dpsId];
+      }
+    }
+    this.recordLiveStatus(duid, status);
+  }
+
+  // A live status field, or undefined when unknown or stale. Values older
+  // than three poll intervals (polling stops while a device is offline) fall
+  // back to the HomeData snapshot.
+  getLiveStatus(duid, property) {
+    const fields = this.liveStatus.get(duid);
+    const field = fields && fields[property];
+    if (!field || Date.now() - field.at > this.updateInterval * 3 * 1000) {
+      return undefined;
+    }
+    return field.value;
+  }
+
   getVacuumDeviceStatus(duid, property) {
+    const liveValue = this.getLiveStatus(duid, property);
+    if (liveValue !== undefined) {
+      return liveValue;
+    }
+
     const propertyID = this.getVacuumSchemaId(duid, property);
 
     if (propertyID == null) {

@@ -33,6 +33,12 @@ describe("Roborock HTTP dependency compatibility", () => {
       const requests: InternalAxiosRequestConfig[] = [];
       axios.defaults.adapter = async (config) => {
         requests.push(config);
+        if (config.url === "api/v3/app/agreement/latest") {
+          return jsonResponse(config, {
+            code: 200,
+            data: { majorVersion: 16, minorVersion: 1 },
+          });
+        }
         return jsonResponse(config, {
           code: 200,
           data: { token: "test-token" },
@@ -54,8 +60,14 @@ describe("Roborock HTTP dependency compatibility", () => {
           : await roborockAuth.loginByPassword(api, credentials);
 
       expect(result).toEqual({ code: 200, data: { token: "test-token" } });
-      expect(requests).toHaveLength(1);
-      const request = requests[0];
+      expect(requests).toHaveLength(2);
+      const agreementRequest = requests[0];
+      expect(axios.getUri(agreementRequest)).toBe(
+        "https://euiot.roborock.com/api/v3/app/agreement/latest?country=DE"
+      );
+      expect(agreementRequest.headers.get("header_clientlang")).toBe("en");
+
+      const request = requests[1];
       expect(axios.getUri(request)).toBe(
         `https://euiot.roborock.com/api/v4/auth/email/login/${method === "code" ? "code" : "pwd"}`
       );
@@ -73,6 +85,8 @@ describe("Roborock HTTP dependency compatibility", () => {
       expect(request.headers.get("x-mercy-ks")).toBe(credentials.s);
       const form = new URLSearchParams(request.data);
       expect(form.get("email")).toBe(credentials.email);
+      expect(form.get("majorVersion")).toBe("16");
+      expect(form.get("minorVersion")).toBe("1");
       if (method === "code") {
         expect(form.get("code")).toBe(credentials.code);
         expect(form.get("countryCode")).toBe("49");

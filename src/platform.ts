@@ -20,6 +20,7 @@ import { RoborockApi } from "./roborock_api";
 import { RoborockPlatformConfig } from "./types";
 import { PLATFORM_NAME, PLUGIN_NAME } from "./settings";
 import { decryptSession } from "./crypto";
+import { DeviceErrorBridge, DeviceErrorEntry } from "./device_error_bridge";
 import {
   DeviceProtocol,
   isMatterFallback,
@@ -83,6 +84,7 @@ const DPS_STATUS_FIELDS: Record<string, string> = {
   "122": "battery",
   "123": "fan_power",
   "124": "water_box_mode",
+  "133": "charge_status",
 };
 
 function translateDpsFields(payload: Record<string, any>): Record<string, any> {
@@ -139,6 +141,9 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
   // Devices whose scenes are bridged as Matter buttons. null means the
   // option is absent from the config (legacy) — enabled for every device.
   private readonly matterSceneDeviceIds: Set<string> | null;
+  // Device errors shown on the settings page, which can ask for them to be
+  // resolved (see device_error_bridge.ts).
+  private readonly errorBridge: DeviceErrorBridge;
 
   /**
    * This constructor is where you should parse the user config
@@ -197,6 +202,16 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
       currentRoomMqtt: this.platformConfig.currentRoomMqtt,
     });
 
+    this.errorBridge = new DeviceErrorBridge(
+      storagePath,
+      async (duid) => {
+        const sent = await this.roborockAPI.resolveError(duid);
+        this.publishDeviceErrors();
+        return sent;
+      },
+      this.log
+    );
+
     /**
      * When this event is fired it means Homebridge has restored all cached accessories from disk.
      * Dynamic Platform plugins should only register new accessories after this event was fired,
@@ -217,6 +232,8 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
 
     this.api.on(APIEvent.SHUTDOWN, () => {
       this.log.debug("Shutting down...");
+
+      this.errorBridge.stop();
 
       if (this.roborockAPI) {
         this.roborockAPI.stopService();
@@ -331,6 +348,7 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
             dockWash.updateFromRoborockData(data);
           }
         }
+        self.publishDeviceErrors();
         return;
       }
 
@@ -342,12 +360,10 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
         // Scenes load asynchronously; sync the Matter scene buttons once
         // they are available (or when they change).
         self.syncMatterScenes();
-        // The HomeData refresh is the only periodic status source — the
-        // roborockLib get_status interval runs but its results never reach
-        // the cache this plugin reads (gated on an unset config field, and
-        // written to a state path getVacuumDeviceStatus does not read).
-        // Mirror it into the Matter vacuums the same way updateDeviceState
-        // does for the HAP accessories.
+        // Periodic status sync. getVacuumDeviceStatus serves the device's
+        // live status (get_status polls and broadcasts) and falls back to
+        // the HomeData snapshot. Mirror it into the Matter vacuums the same
+        // way updateDeviceState does for the HAP accessories.
         for (const matterVacuum of self.matterVacuums.values()) {
           matterVacuum.refreshFromDevice();
         }
@@ -355,6 +371,7 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
         for (const dockWash of self.matterDockWash.values()) {
           dockWash.refreshFromDevice();
         }
+        self.publishDeviceErrors();
       }
     });
 
@@ -363,6 +380,8 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
         self.log.info("Service started");
         //call the discoverDevices function
         self.discoverDevices();
+        self.publishDeviceErrors();
+        self.errorBridge.start();
       })
     ).catch((error) => {
       self.log.error(
@@ -428,6 +447,29 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
   isSupportedDevice(model: string | null): boolean {
     // model must start with "roborock.vacuum."
     return typeof model === "string" && model.startsWith("roborock.vacuum.");
+  }
+
+  /**
+   * Publish every bridged vacuum's current robot and dock error for the
+   * settings page. Cheap when nothing changed (the bridge skips the write).
+   */
+  private publishDeviceErrors(): void {
+    if (!this.roborockAPI.isInited()) {
+      return;
+    }
+
+    const errorCode = (duid: string, field: string): number =>
+      Number(this.roborockAPI.getVacuumDeviceStatus(duid, field)) || 0;
+    const devices: DeviceErrorEntry[] = this.roborockAPI
+      .getVacuumList()
+      .filter((device) => !this.isSkippedDeviceId(device.duid))
+      .map((device) => ({
+        duid: device.duid,
+        name: device.name,
+        errorCode: errorCode(device.duid, "error_code"),
+        dockErrorCode: errorCode(device.duid, "dock_error_status"),
+      }));
+    this.errorBridge.publish(devices);
   }
 
   isSkippedDeviceId(deviceId: unknown): boolean {

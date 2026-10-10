@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.2.9+wahltho.1
+
+- **Upstream 2.2.9**: Includes local-only startup from cached cloud data, live device status, Matter room and charging fixes, current agreement versions during login, device-error clearing, and recovery of silent cloud MQTT sessions from the upstream 2.2.7 through 2.2.9 releases below.
+- **Retained fork fix**: Repeatedly unanswered local requests select cloud transport for the rest of the plugin session. A successful TCP reconnect only clears a temporary connection-failure fallback, not this session-wide protection.
+- **Retained fork fix**: Empty room mappings warn once per device until a valid mapping is received.
+- **Security**: Keep the Axios 1.20 dependency floor, update the transitive `ip-address` package to 10.7.3, and leave the obsolete `jszip` dependency removed.
+
+## 2.2.9
+
+- **Fix (Matter)**: Rooms are now published on a map (#60). They used to be published without one, and Apple Home showed no rooms. Room selection works as before
+- **Fix (status)**: Vacuum status (state, battery, charging, error, fan and water settings) now comes from the vacuum itself. The plugin polls `get_status` on every refresh and keeps the real-time status broadcasts, instead of relying on the cloud's home-data snapshot, which can lag behind the device. This fixes Matter vacuums that kept an old state, such as "Return to dock" staying available while the vacuum was already docked (#60). HAP accessories read the same status
+- **Fix (Matter)**: The charging state is reported correctly. "Not charging" was sent as Matter's "fully charged" value, and models that do not report `charge_status` now derive it from the charging and charged states
+- **Fix (Matter)**: The start button no longer fails with `Cannot resume in current state` (#60). A Resume command sent while the vacuum is stopped or docked now starts a clean, and honors the room selection
+- **Change (Matter)**: A vacuum that is returning to or docking at its station now reports "Seeking charger" instead of "Running"
+- **New**: Clear device errors from the settings page. Some errors stay on the vacuum until they are marked as resolved in the Roborock app, even after the cause is fixed, such as the dock's "clean water tank empty" after a refill. When a vacuum reports an error, the settings page now shows it in the device list with a **Clear error** button that resolves it, like **Resolved** in the Roborock app. Homebridge must be running
+- **Fix (login)**: Signing in no longer fails with code 3006 ("user agreement version is not up-to-date"). The login sent a fixed user agreement version, but the current version differs per Roborock server and country; it is now fetched before each login, with the old value as the fallback
+- **Fix (connectivity)**: A cloud connection that stays connected but no longer delivers any messages is restarted. This only happens when the connection reports itself as connected, the Roborock cloud is reachable, and several requests in a row got no answer with no other message in between; restarts back off from 30 minutes up to 6 hours while they do not help. A network or Roborock outage does not trigger restarts
+
+## 2.2.8
+
+- **New**: Project website in English, Traditional Chinese and Japanese: [tasict.github.io/homebridge-roborock-vacuum](https://tasict.github.io/homebridge-roborock-vacuum/). It is now the plugin's homepage in the Homebridge UI
+- **New**: You can now support the plugin by buying me a boba (paid by card, no PayPal account needed) or with PayPal: from the bottom of the plugin settings, the donate link in the Homebridge UI, the README or GitHub's Sponsor button
+- **Change (packaging)**: The npm package no longer contains a development test script, a leftover client ID file or the protocol sniffing helper; it now holds only what the plugin needs to run
+- **Docs**: README rewritten around the current feature set — supported models (with corrected names such as Qrevo Curv), requirements matching the supported Homebridge and Node.js versions, the sign-in flow, and a reference of every config option. The header image is now the plugin's own icon
+- **Change (config UI)**: The settings page describes what it is for, and has a small support footer below the settings
+
+## 2.2.7
+
+- **Fix (connectivity)**: The plugin no longer fails to start when the Roborock cloud is unreachable. Startup used to abandon everything after the home-data request timed out (`AxiosError: timeout of 20000ms exceeded`, `ECONNRESET`), so no accessories were registered and every command was refused with "Adapter not inited" — even though the vacuum was reachable on the LAN the whole time. The home data (device list and local keys) is now cached on disk, and when the cloud fetch fails the plugin starts in **local-only mode** from that cache: it still runs LAN discovery, connects to each vacuum over the local protocol, publishes the accessories, and accepts start/stop/dock commands. Cloud-only features (scenes, push updates, fresh online flags) resume by themselves once the cloud answers again, without a Homebridge restart. One successful online start is needed to seed the cache; with no cache the plugin stays idle as before, now with a message that says why
+- **Fix (connectivity)**: A vacuum the plugin is locally connected to is treated as online even when the cached cloud status says otherwise, so commands and polling are not blocked by a stale offline flag during a cloud outage
+- **Fix (connectivity)**: Local-only mode no longer depends on UDP discovery finding the vacuums. Each device's last known LAN address is cached next to the device list, so vacuums on another VLAN (or when port 58866 is taken by another integration on the same host) are still dialed directly while the cloud is down
+- **Fix (connectivity)**: Local-only mode also works without a cloud session. When the login itself fails while the cloud is down (or the cached session was cleared), the plugin still starts from the cache and logs in again on the periodic refresh once the cloud answers. Only network-level login failures are retried; a rejected login or a pending two-factor prompt is left to the Config UI
+- **Fix (connectivity)**: A degraded cloud no longer costs you the session. The cached session is cleared only when the login API explicitly rejects it with an API error code. An empty or malformed answer, and a `401` from the device API that the login API does not confirm, are treated as transient and retried
+- **Fix (connectivity)**: The cached device list is tagged with the account it was fetched for and ignored after switching accounts, so a local-only start never controls another account's vacuums
+- **Fix (logging)**: During an outage the periodic home-data refresh logs its failure once at error level and then at debug level until the cloud answers again, instead of an error every interval. The signed device API now times out after 20 s instead of hanging on a black-holed connection
+
 ## 2.2.6+wahltho.1
 
 - **Version metadata**: Identify the local fork with SemVer build metadata instead of a prerelease suffix. Homebridge UI no longer offers upstream 2.2.6 as an update; genuinely newer upstream versions remain visible. Runtime code and dependencies are unchanged.
@@ -57,7 +93,7 @@ Maintenance release — no functional changes to device control. Reworks the fou
 
 ## 2.2.0
 
-Connectivity and device-support release, porting recent fixes from the python-roborock and ioBroker.roborock upstream projects (see `UpstreamReview-2026-07.md`).
+Connectivity and device-support release, porting recent fixes from the python-roborock and ioBroker.roborock upstream projects.
 
 - **New Feature**: Docks introduced since 2025 (Qrevo Curv, Saros 10, Qrevo S5V, Saros 20, and other new dock type codes 10–40) now get their dust-collection, mop-wash, and drying features — including the dock mop-wash switch. Unknown future dock types default to full-featured instead of featureless
 - **New Feature**: Room names now resolve for vacuums shared from another Roborock account (fetched via the device-share rooms API), so Matter room cleaning and the current-room publisher work on shared devices
