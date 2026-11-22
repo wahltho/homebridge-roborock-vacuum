@@ -9,6 +9,7 @@ function createConnector() {
     vacuums: { "vacuum-1": { getParameter } },
   };
   const connector = new localConnector(adapter);
+  jest.spyOn(connector, "discoverLocalDevices").mockResolvedValue({});
   return { adapter, connector, getParameter };
 }
 

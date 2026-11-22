@@ -1,10 +1,8 @@
-import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
 import { createHash, createHmac } from "crypto";
 
 const roborockAuth = require("../roborockLib/lib/roborockAuth");
 const { fetchDevices } = require("../roborockLib/lib/roborockHome");
 
-const originalAdapter = axios.defaults.adapter;
 const loginOptions = {
   baseURL: "https://euiot.roborock.com/",
   username: "test@example.com",
@@ -12,38 +10,34 @@ const loginOptions = {
   language: "de",
 };
 
-function jsonResponse(config: InternalAxiosRequestConfig, data: unknown) {
-  return {
-    config,
-    status: 200,
-    statusText: "OK",
-    headers: { "content-type": "application/json" },
-    data: JSON.stringify(data),
-  };
+function mockRequests(respond: (request: Request) => unknown) {
+  const requests: Request[] = [];
+  jest.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    const request = new Request(url, init);
+    requests.push(request);
+    return Response.json(respond(request));
+  });
+  return requests;
 }
 
 describe("Roborock HTTP dependency compatibility", () => {
   afterEach(() => {
-    axios.defaults.adapter = originalAdapter;
+    jest.restoreAllMocks();
   });
 
   it.each(["code", "password"])(
     "preserves %s login form serialization and authentication headers",
     async (method) => {
-      const requests: InternalAxiosRequestConfig[] = [];
-      axios.defaults.adapter = async (config) => {
-        requests.push(config);
-        if (config.url === "api/v3/app/agreement/latest") {
-          return jsonResponse(config, {
+      const timeout = jest.spyOn(AbortSignal, "timeout");
+      const requests = mockRequests((request) => {
+        if (new URL(request.url).pathname === "/api/v3/app/agreement/latest") {
+          return {
             code: 200,
             data: { majorVersion: 16, minorVersion: 1 },
-          });
+          };
         }
-        return jsonResponse(config, {
-          code: 200,
-          data: { token: "test-token" },
-        });
-      };
+        return { code: 200, data: { token: "test-token" } };
+      });
       const api = roborockAuth.createLoginApi(loginOptions);
       const credentials = {
         email: loginOptions.username,
@@ -62,16 +56,16 @@ describe("Roborock HTTP dependency compatibility", () => {
       expect(result).toEqual({ code: 200, data: { token: "test-token" } });
       expect(requests).toHaveLength(2);
       const agreementRequest = requests[0];
-      expect(axios.getUri(agreementRequest)).toBe(
+      expect(agreementRequest.url).toBe(
         "https://euiot.roborock.com/api/v3/app/agreement/latest?country=DE"
       );
       expect(agreementRequest.headers.get("header_clientlang")).toBe("en");
 
       const request = requests[1];
-      expect(axios.getUri(request)).toBe(
+      expect(request.url).toBe(
         `https://euiot.roborock.com/api/v4/auth/email/login/${method === "code" ? "code" : "pwd"}`
       );
-      expect(request.timeout).toBe(20000);
+      expect(timeout.mock.calls).toEqual([[20000], [20000]]);
       expect(request.headers.get("Content-Type")).toBe(
         "application/x-www-form-urlencoded"
       );
@@ -83,7 +77,7 @@ describe("Roborock HTTP dependency compatibility", () => {
       );
       expect(request.headers.get("x-mercy-k")).toBe(credentials.k);
       expect(request.headers.get("x-mercy-ks")).toBe(credentials.s);
-      const form = new URLSearchParams(request.data);
+      const form = new URLSearchParams(await request.text());
       expect(form.get("email")).toBe(credentials.email);
       expect(form.get("majorVersion")).toBe("16");
       expect(form.get("minorVersion")).toBe("1");
@@ -98,19 +92,18 @@ describe("Roborock HTTP dependency compatibility", () => {
   );
 
   it("retains token headers, Hawk signing and JSON responses for device discovery", async () => {
-    const requests: InternalAxiosRequestConfig[] = [];
+    const timeout = jest.spyOn(AbortSignal, "timeout");
     const rriot = {
       u: "test-user",
       s: "test-session",
       h: "test-signing-key",
       r: { a: "https://api.example.test/" },
     };
-    axios.defaults.adapter = async (config) => {
-      requests.push(config);
-      if (config.url === "api/v1/getHomeDetail") {
-        return jsonResponse(config, { data: { rrHomeId: "test-home" } });
+    const requests = mockRequests((request) => {
+      if (new URL(request.url).pathname === "/api/v1/getHomeDetail") {
+        return { data: { rrHomeId: "test-home" } };
       }
-      return jsonResponse(config, {
+      return {
         result: {
           products: [{ id: "product-1", model: "roborock.vacuum.a168" }],
           devices: [
@@ -118,8 +111,8 @@ describe("Roborock HTTP dependency compatibility", () => {
           ],
           receivedDevices: [],
         },
-      });
-    };
+      };
+    });
 
     await expect(
       fetchDevices({
@@ -137,10 +130,10 @@ describe("Roborock HTTP dependency compatibility", () => {
     expect(requests).toHaveLength(2);
     expect(requests[0].headers.get("Authorization")).toBe("test-token");
     const signedRequest = requests[1];
-    expect(axios.getUri(signedRequest)).toBe(
+    expect(signedRequest.url).toBe(
       "https://api.example.test/v2/user/homes/test-home"
     );
-    expect(signedRequest.timeout).toBe(20000);
+    expect(timeout.mock.calls).toEqual([[20000], [20000]]);
     const authorization = String(signedRequest.headers.get("Authorization"));
     expect(authorization).toMatch(/^Hawk /);
     const fields = Object.fromEntries(
@@ -169,10 +162,8 @@ describe("Roborock HTTP dependency compatibility", () => {
   });
 
   it("propagates transport failures without treating them as a login response", async () => {
-    const error = new AxiosError("timeout", AxiosError.ECONNABORTED);
-    axios.defaults.adapter = async () => {
-      throw error;
-    };
+    const error = new Error("connection closed");
+    jest.spyOn(globalThis, "fetch").mockRejectedValue(error);
     const api = roborockAuth.createLoginApi(loginOptions);
 
     await expect(
@@ -184,6 +175,6 @@ describe("Roborock HTTP dependency compatibility", () => {
         k: "0123456789abcdef",
         s: "test-signature",
       })
-    ).rejects.toBe(error);
+    ).rejects.toMatchObject({ isRequestError: true, cause: error });
   });
 });

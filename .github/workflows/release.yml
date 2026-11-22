@@ -1,0 +1,191 @@
+name: Release
+
+# Cuts a release from master: checks and packs the code, stages the package
+# on npm with trusted publishing (OIDC, no token), bumps the version (commit
+# "<version>" and tag "v<version>", like `npm version`) and publishes the
+# GitHub release, with the version's CHANGELOG.md section, once the staged
+# version has been approved on npm.
+#
+# Before running it, commit the "## <version>" section of CHANGELOG.md; the
+# run stops before changing anything when the section is missing.
+#
+# npm has to trust this workflow for the package, or staging fails with E401:
+#   npm trust github <package> --file release.yml --repo <owner>/<repo> \
+#     --allow-stage-publish
+# It only accepts `npm stage publish` from this workflow: a maintainer must
+# approve the staged version with 2FA (npmjs.com, or `npm stage approve`)
+# before it goes public. The last job waits up to 60 minutes for that and
+# then publishes the draft release; if it times out, publish the draft
+# release by hand after approving.
+#
+# The package is staged before anything is pushed, so a run that npm refuses
+# changes nothing and can be started again. If the push or the draft release
+# fails after that, reject the staged version (`npm stage reject`) before the
+# next run.
+#
+# Only the "prepare" job installs dependencies, and it has no write or
+# id-token permission; the job holding the OIDC permission never runs
+# third-party install scripts, and publishes the packed tarball (npm runs
+# no lifecycle scripts for a tarball).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "patch, minor, major, or an exact version such as 2.3.0"
+        required: true
+        default: patch
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+      version: ${{ steps.version.outputs.version }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+
+      - name: Resolve version
+        id: version
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          npm version "$REQUESTED" --no-git-tag-version --ignore-scripts
+          NAME=$(node -p 'require("./package.json").name')
+          VERSION=$(node -p 'require("./package.json").version')
+
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists."
+            exit 1
+          fi
+          if curl -fsS -o /dev/null "https://registry.npmjs.org/$NAME/$VERSION"; then
+            echo "::error::Version $VERSION is already on npm."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/release"
+          node scripts/changelog_section.js "$VERSION" > "$RUNNER_TEMP/release/notes.md"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Pack
+        id: pack
+        run: |
+          TARBALL=$(npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/release" | tail -n 1)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+
+  publish:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the version commit and tag, create the release
+      id-token: write # npm trusted publishing
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARBALL: ${{ needs.prepare.outputs.tarball }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      # No dependency installs here: npm version edits package.json and
+      # package-lock.json only, and scripts are skipped.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Check npm
+        run: |
+          # npm stage needs npm 11.15.0 or later (trusted publishing 11.5.1).
+          node -e '
+            const [major, minor] = process.argv[1].split(".").map(Number);
+            if (major < 11 || (major === 11 && minor < 15)) {
+              console.error(`npm ${process.argv[1]} is too old for npm stage publish.`);
+              process.exit(1);
+            }' "$(npm --version)"
+
+      # The push below fails when master has moved since this run started;
+      # stop before staging, as a staged version has to be rejected by hand.
+      - name: Stage on npm
+        run: |
+          git fetch origin master
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
+            echo "::error::master has moved since this run started. Run the workflow again."
+            exit 1
+          fi
+          npm stage publish "$RUNNER_TEMP/release/$TARBALL"
+
+      - name: Commit and tag
+        run: |
+          npm version "$VERSION" --no-git-tag-version --ignore-scripts
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git commit -am "$VERSION"
+          git tag -a "v$VERSION" -m "$VERSION"
+          git push origin HEAD:master "v$VERSION"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" --draft --verify-tag \
+            --title "v$VERSION" --notes-file "$RUNNER_TEMP/release/notes.md"
+
+  release:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    permissions:
+      contents: write # publish the draft release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NAME: ${{ needs.prepare.outputs.name }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Wait for approval on npm
+        run: |
+          echo "Approve the staged $NAME@$VERSION on npmjs.com (or npm stage approve) to finish the release."
+          for _ in $(seq 120); do
+            if curl -fsS -o /dev/null "https://registry.npmjs.org/$NAME/$VERSION"; then
+              echo "$NAME@$VERSION is on npm."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::$NAME@$VERSION was not approved within 60 minutes. After approving it, publish the draft release v$VERSION by hand."
+          exit 1
+
+      - name: Publish release
+        run: gh release edit "v$VERSION" --draft=false --latest

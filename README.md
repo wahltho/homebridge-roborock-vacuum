@@ -18,7 +18,7 @@ This plugin is inspired by and adapted from the [ioBroker.roborock](https://gith
 
 ## Local fork behavior
 
-The `wahltho` fork follows upstream 2.2.6 and retains two local safeguards:
+The `wahltho` fork follows upstream 2.5.0 and retains two local safeguards:
 
 - After three consecutive unanswered local requests, that device uses cloud transport for the rest of the plugin session. A plugin restart retries local transport. A TCP reconnect alone does not reset this protection, since an open socket does not prove that the device answers requests.
 - An empty room mapping warns once per device until a valid mapping arrives.
@@ -30,12 +30,12 @@ Temporary TCP connection failures still use upstream's DHCP-aware reconnect logi
 - **Automatic device discovery** — no device IDs or IP addresses to look up. The Roborock region is detected from your account.
 - **Start, stop and send home** — over HomeKit the vacuum is a fan-style accessory: turn it on to start cleaning, off to stop and return to the dock.
 - **Battery, charging and status** — battery level, charging state, low-battery warning, and a fault/offline flag when the vacuum reports an error or loses its connection.
-- **Roborock scenes as switches** — every enabled scene from the Roborock app that uses the vacuum can be run from Apple Home.
+- **Roborock scenes as switches** — every enabled scene from the Roborock app that uses the vacuum can be run from Apple Home. Each switch has the scene's name, and a name you give it in the Home app is kept.
 - **Dock mop-wash switch** on docks that wash the mop. See [Dock mop-wash switch](#dock-mop-wash-switch).
 - **Consumables** (HomeKit) — remaining life of the filter, main brush and side brush, with a change reminder at 5% or less.
 - **Clear errors from the settings page** — an error the vacuum or dock keeps reporting after you fixed the cause can be cleared without the Roborock app. See [Clearing device errors](#clearing-device-errors).
 - **Matter (Beta)** — publish a vacuum as a native Matter robot vacuum, with room cleaning and clean modes. See [Matter support (Beta)](#matter-support-beta).
-- **Works through cloud outages** — local control over the LAN, and a local-only start when the Roborock cloud is unreachable. See [Cloud outages and local-only mode](#cloud-outages-and-local-only-mode).
+- **Local first, works through cloud outages** — commands, status, consumables and scenes go over the LAN, with the cloud as the fallback, and the plugin starts in local-only mode when the Roborock cloud is unreachable. See [Cloud outages and local-only mode](#cloud-outages-and-local-only-mode).
 - **Current room → MQTT** (optional) — publish the room being cleaned to your MQTT broker. See [Current Room → MQTT](#current-room--mqtt-optional-telemetry).
 - **Per-device choice** — publish each vacuum over HomeKit or Matter, or skip it (for example a vacuum shared from another home).
 
@@ -43,7 +43,9 @@ Temporary TCP connection failures still use upstream's DHCP-aware reconnect logi
 
 The plugin works with vacuums that are on your **Roborock app** account. These models are known to work:
 
-S4, S4 Max, S5 Max, S6, S6 Pure, S6 MaxV, S7, S7 MaxV (Ultra), S7 Pro Ultra, S7 Max Ultra, S8, S8 Pro Ultra, Q5+, Q5 Pro, Q7, Q7 Max, Q8 Max, Qrevo, Qrevo Pro, Qrevo S, Qrevo Curv, Saros 10, and the models `roborock.vacuum.a95`, `roborock.vacuum.a159` and `roborock.vacuum.ss07`.
+S4, S4 Max, S5 Max, S6, S6 Pure, S6 MaxV, S7, S7 MaxV (Ultra), S7 Pro Ultra, S7 Max Ultra, S8, S8 Pro Ultra, S8 MaxV Ultra, Q5+, Q5 Pro, Q7, Q7 Max, Q8 Max, Qrevo, Qrevo Pro, Qrevo S, Qrevo Curv, Saros 10, and the models `roborock.vacuum.a95` and `roborock.vacuum.a159`.
+
+The Q10 series (`roborock.vacuum.ss07`, such as the Q10 S5+) is supported through the Roborock cloud; see [Q10 series](#q10-series).
 
 Most other vacuums in the Roborock app work as well; which extras (dock mop wash, consumables, clean modes) appear depends on what the model reports. A vacuum that is set up only in the Xiaomi Home app is not on your Roborock account, so the plugin cannot see it.
 
@@ -100,7 +102,7 @@ The settings page writes these keys to the `RoborockVacuumPlatform` block in `co
 #### What you get over Matter
 
 - The **native robot-vacuum accessory** in Apple Home (proper icon, start/stop, Siri) instead of the fan-style HAP accessory.
-- **Room cleaning**: the vacuum's named rooms are exposed through the Matter ServiceArea cluster. Pick rooms in the controller and start cleaning — selecting none (or all) runs a full clean. While a room clean runs, the controller shows the room currently being cleaned.
+- **Room cleaning**: the vacuum's named rooms are exposed through the Matter ServiceArea cluster. Pick rooms in the controller and start cleaning — selecting none (or all) runs a full clean. While a room clean runs, the controller shows the room currently being cleaned. Vacuums with several saved floor maps publish each floor as its own map (Apple Home shows a **Cleaning Map** picker): see [Multi-floor maps](#multi-floor-maps).
 - **Vacuum / Mop / Vacuum & Mop** clean modes, mapped to the Roborock suction and water-box settings (models without a water box only offer Vacuum).
 - **Battery, charging state and error reporting** (stuck, dust bin missing, dock unreachable, … are surfaced as Matter operational errors).
 - Every Roborock **scene** that targets the device becomes an on/off button (see step 5 below). When the same scene name exists on more than one Matter vacuum, the vacuum's name is appended to keep the buttons distinguishable.
@@ -124,29 +126,63 @@ Run-mode semantics follow the Matter spec: setting the run mode to **Idle stops*
 
 Pairing is one-time per node — switching a device between HAP and Matter later does **not** require re-pairing, but note that **changing a device's protocol re-creates the accessory**, so room and automation assignments in your home app are lost and must be re-organized.
 
+#### Multi-floor maps
+
+When the vacuum has more than one saved map, every floor is published with its own rooms, and Apple Home lists them under **Cleaning Map**.
+
+- **Learning each floor's rooms**: the vacuum only reports the rooms of the map it has loaded. Once, while the vacuum sits on its dock, the plugin loads each other map for a few seconds, reads its rooms and loads the original map again, like Home Assistant does. The vacuum does not move, and a clean started in that time is refused (try again a minute later). The result is saved on disk (`roborock.multimap.<duid>.json` in the Homebridge storage folder). Each map is read only once; after that a floor's rooms are updated whenever that map is loaded, on every refresh and when a clean switches to it.
+- **Floors without rooms**: a map whose rooms are not divided or named in the Roborock app is published as one area named after the floor. Selecting it cleans the whole floor.
+- **Cleaning another floor**: starting a clean of rooms on a map that is not loaded first loads that map, like a Roborock scene that switches floors, and only cleans once the vacuum lists the same rooms on it. **The vacuum must already be on that floor.** Rooms from several floors cannot be cleaned in one go, and maps are only switched while the vacuum is idle on its dock.
+- The first map, and a vacuum with a single map, keep their existing map and area ids, so room selections and automations keep working, also after you add a floor.
+
 #### Known limitations
 
 - **Apple Home compatibility is immature** — see the warning at the top of this section. Treat this as a beta and expect to occasionally re-pair or restart Homebridge after controller/iOS updates.
 - The device always pairs as a generic, uncertified **"Matter Accessory"**: controllers look the bridge's test vendor ID up in the certification database and ignore the name the device advertises, so the name must be entered manually (the pairing panel shows what to type).
 - Scene buttons require the **separate bridge pairing** (step 5) and appear as plain on/off switches in the controller.
-- Multi-floor maps are not exposed (rooms come from the currently active map), and zone cleaning, consumables and dock controls other than the mop-wash switch are not available over Matter yet.
+- Zone cleaning, consumables and dock controls other than the mop-wash switch are not available over Matter yet.
 
 ## Cloud outages and local-only mode
 
-Roborock's cloud is required to log in and to read your device list, but it is
-not required to _control_ a vacuum: once the plugin knows a device's local key,
-it talks to the robot directly over your LAN.
+Roborock's cloud is required to log in and to read your device and scene
+lists, but not to _control_ a vacuum: once the plugin knows a device's local
+key, it talks to the robot directly over your LAN. Everything the robot can
+answer locally goes over the LAN first, and the cloud is only the fallback:
 
-The plugin caches the device list, the local keys and each vacuum's last known
-LAN address on disk (owner-readable only) after every successful cloud
-refresh. If the Roborock cloud is unreachable when Homebridge starts, the
-plugin falls back to that cache and starts in **local-only mode**:
+- **Commands** (start, stop, dock, dock wash, rooms) go over the LAN. A
+  command that gets no local answer is sent once more through the cloud.
+- **Status** (state, battery, charging, errors) is read from the robot every
+  15 seconds while it is cleaning, returning or docking, and while the cloud
+  push channel is down; otherwise on the regular refresh.
+- **Consumables** (filter, main and side brush) are computed from the
+  robot's own work times, like the Roborock app does; the cloud's copy is
+  used only when the robot does not report them.
+- **Reachability**: a vacuum with a working local connection is never shown
+  as "Not Responding", whatever the cloud reports.
+- **Scenes** whose steps are all commands for vacuums connected over the LAN
+  run locally, one step after the other: the next step starts once the
+  vacuum is back on the dock and the dock has finished emptying and washing.
+  A step the vacuum refuses, for example while the dock is still washing the
+  mop, is sent again every 30 seconds for up to 10 minutes.
+  Stopping or docking the vacuum from Apple Home, starting another scene on
+  it, or restarting Homebridge drops the remaining steps. Other scenes, and
+  scenes whose first step the vacuum does not accept locally, are run by the
+  Roborock cloud as before. A scene run locally may not show up in the
+  Roborock app's history.
+- **LAN address changes** are found with UDP discovery before the cloud is
+  asked.
 
-- your vacuums still appear in HomeKit, and start/stop/dock commands work over the LAN;
+The plugin caches the device list, the local keys, each vacuum's last known
+LAN address and the scene list on disk (owner-readable only) after every
+successful cloud refresh. If the Roborock cloud is unreachable when Homebridge
+starts, the plugin falls back to that cache and starts in **local-only mode**:
+
+- your vacuums and scene switches still appear in HomeKit, and commands and
+  scenes work over the LAN;
 - vacuums are found by UDP discovery, or dialed at their cached address when
   discovery finds nothing (another VLAN, or port 58866 in use);
-- cloud-only features are unavailable until the cloud returns — scenes, push
-  status updates, and the cloud online flag;
+- changes to the device or scene list, shared vacuums and the cloud's push
+  updates wait until the cloud returns;
 - the plugin keeps retrying in the background, so cloud features come back on
   their own without a Homebridge restart. If the login itself failed during
   the outage, the plugin logs in again by itself once the cloud answers (a
@@ -158,6 +194,44 @@ online start** to create the cache, so a brand-new install cannot start offline,
 and a vacuum that is shared from another Roborock account can only be controlled
 through the cloud.
 
+Some firmwares (such as the S8 MaxV Ultra on 02.39.x) speak a different local
+protocol than the one the cloud reports for them. The plugin detects this when
+it connects and logs `reports protocol 1.0 but answers L01 locally`; nothing
+needs to be configured.
+
+## Q10 series
+
+The Q10 series (`roborock.vacuum.ss07`, such as the Q10 S5+) speaks its own
+protocol, and the plugin translates for it. Q10 robots have no local protocol,
+so they are always controlled through the Roborock cloud; local-only mode does
+not apply to them.
+
+What works:
+
+- Start, pause, resume, stop and return to the dock, over HomeKit and Matter.
+  Starting a paused robot resumes its task.
+- State, battery and charging, from the updates the robot pushes. The plugin
+  asks it for a full status every polling interval.
+- Room cleaning over Matter. The rooms come from the map the robot sends, so
+  they appear once it has sent one after the plugin starts; rooms with a
+  default name in the Roborock app (`rr_living_room`) are shown the way the
+  app shows them (Living Room).
+- Matter clean modes (vacuum, mop, vacuum & mop). Suction and water levels
+  stay as set in the Roborock app.
+- Filter and brush life, from the hours of use the robot reports.
+- Faults that have an Apple Home equivalent, while the robot reports an error.
+  Other faults are named in the log.
+
+Not available on Q10 robots: find me (Matter Identify), resetting consumables,
+the dock mop-wash switch, multi-floor maps, the room currently being cleaned
+and the Current Room → MQTT telemetry. A command the Q10 has no equivalent for
+is not sent, and the log says so.
+
+A Q10 does not answer commands, so a command counts as done once it reaches
+the Roborock cloud; the robot's next status update shows whether it acted on
+it. The Q10 protocol support follows
+[python-roborock](https://github.com/Python-roborock/python-roborock).
+
 ## Dock mop-wash switch
 
 On vacuums whose dock can wash the mop (G10, S7 Pro/MaxV Ultra, S7 Max Ultra, S8 Pro Ultra, Q Revo family, …) the plugin adds a switch that starts and stops a dock mop wash:
@@ -167,7 +241,7 @@ On vacuums whose dock can wash the mop (G10, S7 Pro/MaxV Ultra, S7 Max Ultra, S8
 
 The switch is **stateful**: it turns on whenever the dock is washing the mop — including washes started from the Roborock app or mid-clean wash cycles — and turning it off stops the wash. Devices without a washing dock don't get the switch.
 
-The switch's default name comes from the plugin's translation catalog in the language selected by the **Language** option on the settings page (`"language"` in `config.json`; default `en`, 12 languages including `zh-cn` and `zh-tw`). Changing the language only renames accessories on the next restart — accessory identities never change, so **no re-pairing and no room re-selection is needed**. You can also rename the switch freely in your home app.
+The switch's default name comes from the plugin's translation catalog in the language selected by the **Language** option on the settings page (`"language"` in `config.json`; default `en`, 12 languages including `zh-cn` and `zh-tw`). Changing the language only renames accessories on the next restart — accessory identities never change, so **no re-pairing and no room re-selection is needed**. You can also rename the switch freely in your home app; a renamed switch keeps your name across restarts and language changes.
 
 ## Clearing device errors
 

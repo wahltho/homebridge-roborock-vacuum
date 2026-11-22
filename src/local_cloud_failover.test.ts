@@ -160,9 +160,10 @@ describe("Roborock local transport failover", () => {
           "get_status",
           []
         );
-        const timedOut = expect(request).rejects.toThrow("Local request");
         await jest.advanceTimersByTimeAsync(10000);
-        await timedOut;
+        await expect(request).resolves.toEqual(["ok"]);
+        expect(localSend).toHaveBeenCalledTimes(attempt + 1);
+        expect(cloudSend).toHaveBeenCalledTimes(attempt + 1);
       }
 
       connector.localClients["vacuum-1"].destroy();
@@ -174,7 +175,7 @@ describe("Roborock local transport failover", () => {
         roborock.messageQueueHandler.sendRequest("vacuum-1", "get_status", [])
       ).resolves.toEqual(["ok"]);
       expect(localSend).toHaveBeenCalledTimes(3);
-      expect(cloudSend).toHaveBeenCalledTimes(1);
+      expect(cloudSend).toHaveBeenCalledTimes(4);
       expect(await roborock.isRemoteDevice("vacuum-1")).toBe(true);
       expect(roborock.pendingRequests.size).toBe(0);
     } finally {
@@ -184,8 +185,10 @@ describe("Roborock local transport failover", () => {
 });
 
 function mockTcpConnect(connector: {
+  detectLocalVersion: (duid: string, ip: string) => Promise<void>;
   ensureL01Handshake: (duid: string) => Promise<boolean>;
 }) {
+  jest.spyOn(connector, "detectLocalVersion").mockResolvedValue(undefined);
   jest.spyOn(connector, "ensureL01Handshake").mockResolvedValue(true);
   jest.spyOn(Socket.prototype, "connect").mockImplementation(function (
     this: Socket,

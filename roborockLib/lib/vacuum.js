@@ -177,6 +177,10 @@ class vacuum {
             );
           }
         }
+
+        if (typeof this.adapter.recordConsumables === "function") {
+          this.adapter.recordConsumables(duid, consumables);
+        }
       } else if (parameter == "get_status") {
         // current-room -> MQTT (opt-in telemetry): the only consumer of the
         // 1 Hz status tick (see startDeviceIntervals, which only creates the
@@ -235,8 +239,20 @@ class vacuum {
           } else {
             this.adapter.log.debug(`Room mapping is still empty for ${duid}.`);
           }
+          return;
+        }
+        this.emptyRoomMappingWarningLogged = false;
+        if (
+          typeof this.adapter.isMapDiscoveryRunning === "function" &&
+          this.adapter.isMapDiscoveryRunning(duid)
+        ) {
+          // Multi-map discovery has a different map loaded right now; its
+          // rooms are recorded by discoverMultiMapRooms, not the poll.
         } else {
-          this.emptyRoomMappingWarningLogged = false;
+          // Rebuild from scratch: segment ids repeat across floor maps, so
+          // merging into the old cache would keep the previous map's rooms
+          // after the robot switches floors.
+          const names = {};
           for (const mappedRoom of mappedRooms) {
             const roomID = mappedRoom[1];
             const roomName = this.adapter.roomIDs[roomID];
@@ -247,10 +263,12 @@ class vacuum {
               );
               // Cache segment_id -> name for the Matter ServiceArea cluster
               // (getSegmentRooms) and the current-room MQTT publisher.
-              if (!this.adapter.segmentRoomNames[duid])
-                this.adapter.segmentRoomNames[duid] = {};
-              this.adapter.segmentRoomNames[duid][mappedRoom[0]] = roomName;
+              names[mappedRoom[0]] = roomName;
             }
+          }
+          this.adapter.segmentRoomNames[duid] = names;
+          if (typeof this.adapter.recordCurrentMapRooms === "function") {
+            this.adapter.recordCurrentMapRooms(duid, names);
           }
         }
       } else if (parameter == "get_fw_features") {

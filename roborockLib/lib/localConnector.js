@@ -1,12 +1,12 @@
 "use strict";
 
 const crypto = require("crypto");
-const Parser = require("binary-parser").Parser;
 const net = require("net");
 const dgram = require("dgram");
 
 const PORT = 58866;
 const TIMEOUT = 5000; // 5 Sekunden Timeout
+const LOCAL_PORT = 58867;
 
 const BROADCAST_TOKEN = Buffer.from("qWKYcdQWrbm9hPqe", "utf8");
 
@@ -18,12 +18,18 @@ const RECONNECT_DELAY = 60000;
 // Minimum spacing between cloud-side IP refreshes per device, so the
 // reconnect loop cannot flood the cloud API when a device stays unreachable.
 const IP_REFRESH_MIN_INTERVAL = 60000;
+// How long the local protocol probe waits for an answer to its L01 HELLO.
+const PROBE_TIMEOUT = 3000;
+// PING spacing for L01 devices, which close a local connection after 60 s
+// without traffic.
+const KEEPALIVE_INTERVAL = 30000;
 
 class EnhancedSocket extends net.Socket {
   constructor(options) {
     super(options);
     this.connected = false;
     this.chunkBuffer = Buffer.alloc(0);
+    this.keepaliveTimer = null;
 
     this.on("connect", () => {
       this.connected = true;
@@ -31,6 +37,7 @@ class EnhancedSocket extends net.Socket {
 
     this.on("close", () => {
       this.connected = false;
+      this.stopKeepalive();
     });
 
     this.on("error", () => {
@@ -41,30 +48,48 @@ class EnhancedSocket extends net.Socket {
       this.connected = false;
     });
   }
+
+  stopKeepalive() {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
 }
 
-const localMessageParser = new Parser()
-  .endianess("big")
-  .string("version", {
-    length: 3,
-  })
-  .uint32("seq")
-  .uint16("protocol")
-  .uint16("payloadLen")
-  .buffer("payload", {
-    length: "payloadLen",
-  })
-  .uint32("crc32");
+// Local TCP frames are sent with a 4-byte big-endian length prefix.
+function withLengthPrefix(message) {
+  const lengthBuffer = Buffer.alloc(4);
+  lengthBuffer.writeUInt32BE(message.length, 0);
+  return Buffer.concat([lengthBuffer, message]);
+}
 
-const shortMessageParser = new Parser()
-  .endianess("big")
-  .string("version", {
-    length: 3,
-  })
-  .uint32("seq")
-  .uint32("random")
-  .uint32("timestamp")
-  .uint16("protocol");
+// Random value in [10000, 32767], the range used for the L01 connect_nonce.
+function randomNonce() {
+  return 10000 + Math.floor(Math.random() * 22768);
+}
+
+// Encrypted payload of a UDP discovery broadcast. Layout (big-endian):
+// version(3) seq(4) protocol(2) payloadLen(2) payload crc32(4).
+function broadcastPayload(msg) {
+  const payloadLen = msg.readUInt16BE(9);
+  if (msg.length < 15 + payloadLen) {
+    throw new RangeError(`Truncated broadcast (${msg.length} bytes)`);
+  }
+  return msg.subarray(11, 11 + payloadLen);
+}
+
+// Header-only frame (big-endian): version(3) seq(4) random(4) timestamp(4)
+// protocol(2).
+function parseShortMessage(buffer) {
+  return {
+    version: buffer.toString("utf8", 0, 3),
+    seq: buffer.readUInt32BE(3),
+    random: buffer.readUInt32BE(7),
+    timestamp: buffer.readUInt32BE(11),
+    protocol: buffer.readUInt16BE(15),
+  };
+}
 
 class localConnector {
   constructor(adapter) {
@@ -82,12 +107,23 @@ class localConnector {
       return;
     }
 
+    try {
+      await this.detectLocalVersion(duid, ip);
+    } catch (error) {
+      this.adapter.log.debug(
+        `Local protocol probe failed for ${duid}: ${error.message}`
+      );
+    }
+    if (this.shuttingDown) {
+      return;
+    }
+
     const client = new EnhancedSocket();
 
     // Wrap the connect method in a promise to await its completion
     await new Promise((resolve, reject) => {
       client
-        .connect(58867, ip, async () => {
+        .connect(LOCAL_PORT, ip, async () => {
           this.adapter.log.debug(`tcp client for ${duid} connected`);
           // TCP recovery clears temporary failures, but does not prove that a
           // device previously classified as unresponsive can answer requests.
@@ -102,6 +138,11 @@ class localConnector {
           this.ensureL01Handshake(duid).catch((error) => {
             this.adapter.log.debug(
               `L01 handshake on connect failed for ${duid}: ${error.message}`
+            );
+          });
+          this.startKeepalive(duid, client).catch((error) => {
+            this.adapter.log.debug(
+              `Keepalive setup failed for ${duid}: ${error.message}`
             );
           });
           resolve();
@@ -202,7 +243,7 @@ class localConnector {
               }
             } else {
               try {
-                const shortMessage = shortMessageParser.parse(currentBuffer);
+                const shortMessage = parseShortMessage(currentBuffer);
                 // HELLO_RESPONSE (protocol 1) echoing our seq=1 HELLO; its
                 // random field is the ack_nonce.
                 if (
@@ -289,17 +330,33 @@ class localConnector {
       setTimeout(async () => {
         this.reconnectTimeouts.delete(duid);
         // The IP captured at startup goes stale when DHCP hands the device a
-        // new address; re-query it over the cloud before dialing.
+        // new address; look it up again (LAN first, then cloud) before dialing.
         const refreshedIp = await this.refreshLocalIp(duid);
         await this.createClient(duid, refreshedIp || ip);
       }, RECONNECT_DELAY)
     );
   }
 
-  // Re-query the device's current local IP over the cloud channel
-  // (get_network_info updates adapter.localDevices). Rate-limited per device;
+  // Find the device's current local IP: UDP discovery on the LAN first, then
+  // get_network_info over the cloud channel (which updates
+  // adapter.localDevices). The cloud lookup is rate-limited per device;
   // returns the freshest known IP or undefined when none is available.
   async refreshLocalIp(duid) {
+    const discovered = await this.discoverLocalDevices().catch((error) => {
+      this.adapter.log.debug(`UDP discovery failed: ${error.message}`);
+      return {};
+    });
+    const discoveredIp = discovered[duid];
+    if (discoveredIp) {
+      if (this.adapter.localDevices[duid] !== discoveredIp) {
+        this.adapter.localDevices[duid] = discoveredIp;
+        if (typeof this.adapter.persistLocalDevices === "function") {
+          this.adapter.persistLocalDevices();
+        }
+      }
+      return discoveredIp;
+    }
+
     const now = Date.now();
     const lastRefresh = this.lastIpRefresh.get(duid) || 0;
     if (now - lastRefresh >= IP_REFRESH_MIN_INTERVAL) {
@@ -336,6 +393,7 @@ class localConnector {
 
     for (const duid in this.localClients) {
       try {
+        this.localClients[duid].stopKeepalive();
         this.localClients[duid].destroy();
       } catch (error) {
         /* ignore */
@@ -398,8 +456,87 @@ class localConnector {
     }
   }
 
+  // Some firmwares report pv "1.0" in HomeData but only speak L01 on the LAN
+  // and silently drop 1.0 frames. Probe over a throwaway connection: a device
+  // that answers an L01 HELLO gets L01 for all its local traffic. 1.0 devices
+  // don't answer, which costs them up to PROBE_TIMEOUT per connect. Only an
+  // L01 answer is remembered, so a device that switches to L01 with a
+  // firmware update is picked up on its next reconnect.
+  async detectLocalVersion(duid, ip, port = LOCAL_PORT) {
+    if (this.adapter.localVersions.has(duid)) {
+      return;
+    }
+    if ((await this.adapter.getRobotVersion(duid)) != "1.0") {
+      return;
+    }
+
+    const hello = await this.adapter.message.buildRoborockMessage(
+      duid,
+      0,
+      Math.floor(Date.now() / 1000),
+      Buffer.alloc(0),
+      { version: "L01", seq: 1, random: randomNonce() }
+    );
+
+    const answersL01 = await new Promise((resolve) => {
+      const probe = new net.Socket();
+      const done = (result) => {
+        clearTimeout(timer);
+        probe.destroy();
+        resolve(result);
+      };
+      const timer = setTimeout(() => done(false), PROBE_TIMEOUT);
+      probe.on("data", (data) => {
+        done(data.length >= 7 && data.toString("latin1", 4, 7) == "L01");
+      });
+      probe.on("error", () => done(false));
+      probe.on("close", () => done(false));
+      probe.connect(port, ip, () => probe.write(withLengthPrefix(hello)));
+    });
+
+    if (answersL01) {
+      this.adapter.localVersions.set(duid, "L01");
+      this.adapter.log.info(
+        `Robot ${duid} reports protocol 1.0 but answers L01 locally. Using L01 for the local connection.`
+      );
+    }
+  }
+
+  // A header-only PING (protocol 2, answered with protocol 3, which the data
+  // handler ignores) every KEEPALIVE_INTERVAL keeps an L01 connection open.
+  // 1.0 devices keep idle connections open and get no PING.
+  async startKeepalive(duid, client) {
+    if ((await this.adapter.getRobotVersion(duid, "local")) != "L01") {
+      return;
+    }
+    // The connection may have closed while the version was looked up.
+    if (!client.connected || client.keepaliveTimer) {
+      return;
+    }
+
+    let pingSeq = 0x10000;
+    client.keepaliveTimer = setInterval(async () => {
+      try {
+        const ping = await this.adapter.message.buildRoborockMessage(
+          duid,
+          2,
+          Math.floor(Date.now() / 1000),
+          Buffer.alloc(0),
+          { seq: pingSeq++, random: randomNonce() }
+        );
+        if (ping && client.connected) {
+          client.write(withLengthPrefix(ping));
+        }
+      } catch (error) {
+        this.adapter.log.debug(
+          `Keepalive ping failed for ${duid}: ${error.message}`
+        );
+      }
+    }, KEEPALIVE_INTERVAL);
+  }
+
   async ensureL01Handshake(duid) {
-    const version = await this.adapter.getRobotVersion(duid);
+    const version = await this.adapter.getRobotVersion(duid, "local");
     if (version != "L01") {
       return;
     }
@@ -424,7 +561,7 @@ class localConnector {
     // connect_nonce in [10000, 32767] and store it BEFORE sending, so the follow-up
     // L01 data-message AAD reuses the exact value the robot saw in the HELLO.
     const timestamp = Math.floor(Date.now() / 1000);
-    const connectNonce = 10000 + Math.floor(Math.random() * 22768);
+    const connectNonce = randomNonce();
     this.adapter.localL01Nonces.set(duid, {
       connectNonce,
       ackNonce: undefined,
@@ -458,12 +595,20 @@ class localConnector {
       this.l01HandshakeWaiters.set(duid, { resolve, reject, timeout });
     });
 
-    const lengthBuffer = Buffer.alloc(4);
-    lengthBuffer.writeUInt32BE(handshakeMessage.length, 0);
-    const fullMessage = Buffer.concat([lengthBuffer, handshakeMessage]);
-    client.write(fullMessage);
+    client.write(withLengthPrefix(handshakeMessage));
 
     await handshakePromise;
+  }
+
+  // One UDP discovery at a time: robots reconnecting together share it
+  // instead of competing for the discovery port.
+  discoverLocalDevices() {
+    if (!this.discovery) {
+      this.discovery = this.getLocalDevices().finally(() => {
+        this.discovery = null;
+      });
+    }
+    return this.discovery;
   }
 
   async getLocalDevices() {
@@ -484,9 +629,8 @@ class localConnector {
 
       server.on("message", (msg) => {
         try {
-          const parsedMessage = localMessageParser.parse(msg);
           const decodedMessage = this.decryptECB(
-            parsedMessage.payload,
+            broadcastPayload(msg),
             BROADCAST_TOKEN
           ); // this might be decryptCBC for A01. Haven't checked this yet
 
@@ -525,10 +669,15 @@ class localConnector {
       server.on("error", (error) => {
         // Port 58866 may already be taken by another Roborock integration on
         // the same host. Discovery is best-effort (get_network_info provides
-        // IPs too), so a bind failure must not abort device creation.
-        this.adapter.log.warn(
-          `UDP discovery unavailable (${error.message}). Continuing without it; local IPs will come from the cloud instead.`
-        );
+        // IPs too), so a bind failure must not abort device creation. It is
+        // retried on every reconnect, so only the first failure is a warning.
+        const message = `UDP discovery unavailable (${error.message}). Continuing without it; local IPs will come from the cloud instead.`;
+        if (this.udpDiscoveryWarned) {
+          this.adapter.log.debug(message);
+        } else {
+          this.udpDiscoveryWarned = true;
+          this.adapter.log.warn(message);
+        }
         closeServer();
         if (this.localDevicesTimeout) {
           this.adapter.clearTimeout(this.localDevicesTimeout);

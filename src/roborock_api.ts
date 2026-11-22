@@ -1,7 +1,7 @@
 /**
  * Typed surface of the JavaScript Roborock API (roborockLib/roborockAPI.js)
  * that this plugin actually consumes. The implementation is still untyped
- * legacy code loaded via require(); this interface exists so a rename or
+ * legacy CommonJS code; this interface exists so a rename or
  * signature change over there breaks the build here instead of HomeKit at
  * runtime. Keep it in sync with roborockAPI.js when the surface changes.
  */
@@ -17,6 +17,20 @@ export interface RoborockDevice {
 export interface RoborockSegmentRoom {
   segmentId: number;
   name: string;
+}
+
+/** A saved floor map (get_multi_maps_list). */
+export interface RoborockFloorMap {
+  mapFlag: number;
+  name: string;
+}
+
+/** Every floor map and its named rooms, for the Matter ServiceArea cluster. */
+export interface RoborockMultiMapAreas {
+  // null while the loaded map is unknown (no fresh status).
+  currentMapFlag: number | null;
+  maps: RoborockFloorMap[];
+  rooms: Array<RoborockSegmentRoom & { mapFlag: number }>;
 }
 
 /** A Roborock app scene ("routine") targeting a device. */
@@ -60,12 +74,20 @@ export interface RoborockApi {
   getVacuumDeviceData(duid: string): RoborockDevice | undefined;
   getVacuumDeviceInfo(duid: string, property: string): unknown;
   getVacuumDeviceStatus(duid: string, property: string): number | string;
+  isLocallyConnected(duid: string): boolean;
   getProductAttribute(duid: string, attribute: string): string | null;
   getSegmentRooms(duid: string): RoborockSegmentRoom[];
+  getMultiMapAreas?(duid: string): RoborockMultiMapAreas;
+  getCurrentMapFlag?(duid: string): number | null;
   getScenesForDevice(duid: string): RoborockScene[];
   isDockWashSupported(duid: string): boolean;
   getCleanModeCapabilities(duid: string): CleanModeCapabilities;
   isCleaning(state: number | string): boolean;
+  isBatteryCharging(
+    duid: string,
+    chargeStatus: number | string,
+    state: number | string | undefined
+  ): boolean;
   getTranslation(key: string): string;
 
   // Commands
@@ -81,6 +103,7 @@ export interface RoborockApi {
     repeat?: number
   ): Promise<void>;
   resume_segment_clean(duid: string): Promise<void>;
+  switchToMap?(duid: string, mapFlag: number): Promise<Record<string, string>>;
   setCleanModeParameters(
     duid: string,
     parameters: { fan_power?: number; water_box_mode?: number }

@@ -3,10 +3,10 @@
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const axios = require("axios");
 const crypto = require("crypto");
 
 const roborockAuth = require("./lib/roborockAuth");
+const roborockHome = require("./lib/roborockHome");
 
 const rrLocalConnector = require("./lib/localConnector").localConnector;
 const roborock_mqtt_connector =
@@ -16,6 +16,8 @@ const vacuum_class = require("./lib/vacuum").vacuum;
 const deviceFeatures = require("./lib/deviceFeatures").deviceFeatures;
 const messageQueueHandler =
   require("./lib/messageQueueHandler").messageQueueHandler;
+const { sceneRunner, DOCKED_STATES } = require("./lib/sceneRunner");
+const b01Q10 = require("./lib/b01Q10");
 const mqtt = require("mqtt");
 
 // Schema ids of the status fields in spontaneous status broadcasts
@@ -30,16 +32,26 @@ const DPS_STATUS_FIELDS = {
   133: "charge_status",
 };
 
-function md5hex(str) {
-  return crypto.createHash("md5").update(str).digest("hex");
-}
-
 // Dock types whose station cannot wash the mop: 0 = plain charging dock,
 // 1 and 5 = auto-empty only. Every other dock code (2, 3, 6-40 and future
 // generations) washes the mop, so the gate is membership in this small
 // exception set rather than an ever-growing wash-capable list
 // (see deviceFeatures.processDockType).
 const NON_MOP_WASHING_DOCK_TYPES = [0, 1, 5];
+
+// Rated consumable life in hours, as the Roborock app uses it. Remaining life
+// is computed from get_consumable work times; a consumable without a rated
+// life here keeps the HomeData snapshot. A model with other values gets its
+// own entry.
+const CONSUMABLE_LIFE_HOURS = {
+  default: { main_brush: 300, side_brush: 200, filter: 150 },
+};
+
+// get_status interval while a robot is cleaning, returning or docking, or
+// while the cloud push channel is down.
+const ACTIVE_STATUS_INTERVAL = 15 * 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Bundled i18n catalogs, loaded statically so translation lookup never
 // hands a computed path to the module loader.
@@ -82,11 +94,20 @@ class Roborock {
 
     this.localKeys = null;
     this.localL01Nonces = new Map();
+    // Local protocol version found by probing the device (duid -> version).
+    // Some firmwares (e.g. S8 MaxV Ultra / a97 02.39.x) report pv "1.0" in
+    // HomeData but only answer L01 on the local TCP port.
+    this.localVersions = new Map();
     this.roomIDs = {};
     // current-room -> MQTT (opt-in telemetry): per-duid segment_id -> room name
     // cache, a lazily-opened local publisher client, and the last-published
     // dedupe key per duid. All inert unless config.currentRoomMqtt.enabled.
     this.segmentRoomNames = {};
+    // Multi-floor maps: per-duid { maps: [{ mapFlag, name }], rooms:
+    // { [mapFlag]: { [segmentId]: name } } }, persisted so the map-cycling
+    // discovery (see discoverMultiMapRooms) runs once, not on every boot.
+    this.multiMapData = {};
+    this._mapDiscoveryRunning = new Set();
     this.localMqttClient = null;
     this._lastRoomPublishKey = {};
     this.vacuums = {};
@@ -108,6 +129,7 @@ class Roborock {
     this.message = new rrMessage(this);
 
     this.messageQueueHandler = new messageQueueHandler(this);
+    this.sceneRunner = new sceneRunner(this);
 
     this.pendingRequests = new Map();
 
@@ -148,6 +170,13 @@ class Roborock {
     // { value, at }. getVacuumDeviceStatus prefers it over the HomeData
     // deviceStatus snapshot while fresh — see getLiveStatus.
     this.liveStatus = new Map();
+
+    // Q10 robots (see lib/b01Q10.js): the data points each one has pushed,
+    // accumulated, since a push often carries only one or two of them; when
+    // each one last sent anything; and the log notices already given once.
+    this.q10Dps = new Map();
+    this.q10LastMessageAt = new Map();
+    this.q10Notices = new Set();
 
     this.localDevices = {};
     this.remoteDevices = new Set();
@@ -196,15 +225,16 @@ class Roborock {
 
   // State ids that are mirrored to disk so they survive a restart: the cloud
   // session/client id, and the home data (device list + local keys), its
-  // home id and the devices' last LAN addresses, which let the plugin start
-  // over the LAN when the cloud is down.
+  // home id, the devices' last LAN addresses and the scene list, which let
+  // the plugin start over the LAN when the cloud is down.
   isPersistedStateId(id) {
     return (
       id == "UserData" ||
       id == "clientID" ||
       id == "HomeData" ||
       id == "HomeId" ||
-      id == "LocalDevices"
+      id == "LocalDevices" ||
+      id == "Scenes"
     );
   }
 
@@ -583,9 +613,9 @@ class Roborock {
 
       this.log.warn(
         "Roborock cloud is unreachable - starting in LOCAL-ONLY mode using " +
-          "the last cached device list. Commands are sent over the LAN; " +
-          "cloud features (scenes, push updates) resume automatically once " +
-          "the cloud is reachable again."
+          "the last cached device and scene lists. Commands and scenes run " +
+          "over the LAN; cloud features (push updates, scene list changes) " +
+          "resume automatically once the cloud is reachable again."
       );
     }
 
@@ -614,48 +644,8 @@ class Roborock {
   setupCloudApi(userdata) {
     this.userData = userdata;
     this.loginApi.defaults.headers.common["Authorization"] = userdata.token;
-    const rriot = userdata.rriot;
 
-    this.api = axios.create({
-      baseURL: rriot.r.a,
-      // Fail instead of hanging when the cloud black-holes connections;
-      // otherwise the periodic refresh piles up requests every interval.
-      timeout: 20000,
-    });
-    this.api.interceptors.request.use((config) => {
-      try {
-        const timestamp = Math.floor(Date.now() / 1000);
-        const nonce = crypto
-          .randomBytes(6)
-          .toString("base64")
-          .substring(0, 6)
-          .replace("+", "X")
-          .replace("/", "Y");
-        let url;
-        if (this.api) {
-          url = new URL(this.api.getUri(config));
-          const prestr = [
-            rriot.u,
-            rriot.s,
-            nonce,
-            timestamp,
-            md5hex(url.pathname),
-            /*queryparams*/ "",
-            /*body*/ "",
-          ].join(":");
-          const mac = crypto
-            .createHmac("sha256", rriot.h)
-            .update(prestr)
-            .digest("base64");
-
-          config.headers["Authorization"] =
-            `Hawk id="${rriot.u}", s="${rriot.s}", ts="${timestamp}", nonce="${nonce}", mac="${mac}"`;
-        }
-      } catch (error) {
-        this.log.error("Failed to initialize API. Error: " + error);
-      }
-      return config;
-    });
+    this.api = roborockHome.createSignedApi(userdata.rriot);
   }
 
   // Start (or restart) the cloud MQTT client for a session. Any previous
@@ -827,6 +817,16 @@ class Roborock {
       : {};
   }
 
+  // The scene list cached by getScenes, or null when none is cached for this
+  // account.
+  loadCachedScenes() {
+    const cached = this.getStateAsync("Scenes");
+    if (!cached || cached.account !== this.config.username) {
+      return null;
+    }
+    return cached.val && Array.isArray(cached.val.result) ? cached.val : null;
+  }
+
   persistLocalDevices() {
     if (Object.keys(this.localDevices).length === 0) {
       return; // never replace a useful cache with nothing
@@ -926,6 +926,10 @@ class Roborock {
       () => this.updateHomeData(this.homeId),
       this.updateInterval * 1000
     );
+    // The cached scene list serves a local-only start and a failed scene
+    // fetch; a fresh online start replaces it right below.
+    this.scenesData = this.loadCachedScenes();
+
     // A fresh online start pulls once more to load scenes and reconcile
     // intervals. In local-only mode the cloud is down, so defer to the interval
     // instead of blocking startup on a call that will fail.
@@ -959,6 +963,12 @@ class Roborock {
     for (const device in this.localDevices) {
       const duid = device;
       const ip = this.localDevices[device];
+
+      // Q10 robots have no local protocol; they are reached over the cloud.
+      if (this.isQ10Device(duid)) {
+        this.log.debug(`Not connecting locally to Q10 robot ${duid}.`);
+        continue;
+      }
 
       await this.localConnector.createClient(duid, ip);
     }
@@ -1053,7 +1063,7 @@ class Roborock {
       // login must never be repeated every interval.
       this.loginRetryable = !!(
         error &&
-        error.isAxiosError &&
+        error.isRequestError &&
         (!error.response || error.response.status >= 500)
       );
       if (this.loginRetryable) {
@@ -1167,7 +1177,7 @@ class Roborock {
   async getNetworkInfo() {
     for (const device of this.devices) {
       const duid = device.duid;
-      if (!this.hasInitializedVacuum(duid)) {
+      if (!this.hasInitializedVacuum(duid) || this.isQ10Device(duid)) {
         continue;
       }
 
@@ -1257,12 +1267,23 @@ class Roborock {
       );
     }
 
+    if (!vacuum.activeStatusIntervalHandle) {
+      vacuum.activeStatusIntervalHandle = this.setInterval(
+        this.pollActiveStatus.bind(this),
+        ACTIVE_STATUS_INTERVAL,
+        duid
+      );
+    }
+
     // The 1 Hz status tick only serves the opt-in current-room MQTT
     // telemetry (its own seconds-based gating lives in vacuum.getParameter).
     // Without that feature the interval would fire 86400 no-ops per device
     // per day, so it is not created at all.
+    // A Q10 has no get_status to tick.
     const roomMqttEnabled = !!(
-      this.config.currentRoomMqtt && this.config.currentRoomMqtt.enabled
+      this.config.currentRoomMqtt &&
+      this.config.currentRoomMqtt.enabled &&
+      !this.isQ10Device(duid)
     );
     if (roomMqttEnabled && !vacuum.getStatusIntervalHandle) {
       vacuum.getStatusIntervalHandle = this.setInterval(
@@ -1288,16 +1309,80 @@ class Roborock {
       this.clearInterval(vacuum.getStatusIntervalHandle);
       vacuum.getStatusIntervalHandle = null;
     }
+
+    if (vacuum.activeStatusIntervalHandle) {
+      this.clearInterval(vacuum.activeStatusIntervalHandle);
+      vacuum.activeStatusIntervalHandle = null;
+    }
   }
 
+  // Short-interval get_status over the local connection while the robot is
+  // cleaning, returning or docking, or while cloud pushes are unavailable.
+  // Idle robots with a working push channel wait for the regular poll.
+  async pollActiveStatus(duid) {
+    const vacuum = this.vacuums[duid];
+    if (!vacuum || vacuum.activeStatusPollInFlight) {
+      return;
+    }
+    if (
+      !this.isLocallyConnected(duid) ||
+      (this.rr_mqtt_connector.isConnected() &&
+        !this.isCleaning(this.getVacuumDeviceStatus(duid, "state")))
+    ) {
+      return;
+    }
+
+    vacuum.activeStatusPollInFlight = true;
+    try {
+      await this.pollStatus(duid);
+    } finally {
+      vacuum.activeStatusPollInFlight = false;
+    }
+  }
+
+  // Run a scene over the local connection when every item can run there,
+  // otherwise (or when its first item does not start) in the cloud. A new
+  // scene drops the remaining items of a local run on the same robots.
   async executeScene(sceneID) {
-    if (this.api) {
-      try {
-        await this.api.post(`user/scene/${sceneID.val}/execute`);
-      } catch (error) {
-        if (!(await this.handleApiUnauthorized(error, "executeScene"))) {
-          this.catchError(error.stack, "executeScene");
-        }
+    const scene = ((this.scenesData && this.scenesData.result) || []).find(
+      (scene) => `${scene.id}` === `${sceneID.val}`
+    );
+    if (scene) {
+      const targets = this.sceneRunner.targets(scene);
+      const switching = targets.find((duid) =>
+        this.isMapDiscoveryRunning(duid)
+      );
+      if (switching) {
+        this.log.warn(
+          `Scene "${scene.name}" not started: ${switching} is switching floor maps. Try again in a minute.`
+        );
+        return;
+      }
+      for (const duid of targets) {
+        this.sceneRunner.cancel(duid);
+      }
+      const items = this.sceneRunner.localItems(scene);
+      if (items && (await this.sceneRunner.start(scene, items))) {
+        return;
+      }
+    }
+
+    await this.executeSceneInCloud(sceneID.val);
+  }
+
+  async executeSceneInCloud(sceneId) {
+    if (!this.api) {
+      this.log.warn(
+        `Scene ${sceneId} cannot run: it needs the Roborock cloud, which is not connected.`
+      );
+      return;
+    }
+
+    try {
+      await this.api.post(`user/scene/${sceneId}/execute`);
+    } catch (error) {
+      if (!(await this.handleApiUnauthorized(error, "executeScene"))) {
+        this.catchError(error.stack, "executeScene");
       }
     }
   }
@@ -1343,8 +1428,15 @@ class Roborock {
       const homeId = await this.getHomeID();
       const response = await this.api.get(`user/scene/home/${homeId}`);
 
-      // Store scenes data locally
+      // Store scenes data locally, and on disk for a local-only start.
       this.scenesData = response.data;
+      if (response.data && Array.isArray(response.data.result)) {
+        await this.setStateAsync("Scenes", {
+          val: response.data,
+          ack: true,
+          account: this.config.username,
+        });
+      }
 
       return response.data;
     } catch (error) {
@@ -1560,10 +1652,19 @@ class Roborock {
   async updateDataMinimumData(duid, vacuum, robotModel) {
     this.log.debug(`Latest data requested`);
 
+    // A Q10 answers none of the V1 reads below; it is asked to push its
+    // status (and its map) instead.
+    if (this.isQ10Device(duid)) {
+      await this.requestQ10Status(duid);
+      return;
+    }
+
     if (this.isSupportedVacuumModel(robotModel)) {
       await this.pollStatus(duid);
 
       await vacuum.getParameter(duid, "get_room_mapping");
+
+      await this.refreshMultiMaps(duid);
 
       await vacuum.getParameter(duid, "get_consumable");
 
@@ -1577,7 +1678,6 @@ class Roborock {
         case "roborock.vacuum.a140":
         case "roborock.vacuum.a95":
         case "roborock.vacuum.a159":
-        case "roborock.vacuum.ss07":
           //do nothing
           break;
         case "roborock.vacuum.s6":
@@ -1606,6 +1706,10 @@ class Roborock {
   }
 
   async updateDataExtraData(duid, vacuum) {
+    if (this.isQ10Device(duid)) {
+      return;
+    }
+
     try {
       await this.pollOptional(duid, vacuum, "get_fw_features");
     } catch (error) {
@@ -1623,6 +1727,7 @@ class Roborock {
       this.clearInterval(this.homedataInterval);
     }
 
+    this.sceneRunner.cancelAll();
     this.localConnector.shutdown();
     this.rr_mqtt_connector.disconnectClient();
 
@@ -1796,6 +1901,10 @@ class Roborock {
       return;
     }
 
+    if (["app_start", "app_zoned_clean", "app_goto_target"].includes(command)) {
+      this.assertNoMapSwitch(duid, command);
+    }
+
     switch (command) {
       case "app_zoned_clean":
       case "app_goto_target":
@@ -1961,7 +2070,13 @@ class Roborock {
     }
   }
 
-  async getRobotVersion(duid) {
+  // HomeData's protocol version, or with transport "local" the version the
+  // device was found to speak on the LAN, if that differs.
+  async getRobotVersion(duid, transport) {
+    if (transport == "local" && this.localVersions.has(duid)) {
+      return this.localVersions.get(duid);
+    }
+
     const device = this.getAllHomeDevices().find(
       (device) => device.duid == duid
     );
@@ -1982,6 +2097,16 @@ class Roborock {
 
   async catchError(error, attribute, duid, model) {
     if (!error) {
+      return;
+    }
+
+    // A command the Q10 has no equivalent for was not sent; say so plainly.
+    if (error.code === "ERR_Q10_UNSUPPORTED") {
+      this.log.info(error.message);
+      return;
+    }
+    if (error.code === "ERR_Q10_NOT_SENT") {
+      this.log.warn(`${attribute} for ${duid}: ${error.message}`);
       return;
     }
 
@@ -2272,6 +2397,22 @@ class Roborock {
       return;
     }
 
+    // A Q10 has its own clean-mode data point next to suction and water.
+    if (this.isQ10Device(duid)) {
+      const write = b01Q10.encodeCleanMode(
+        parameters && parameters.fan_power,
+        parameters && parameters.water_box_mode
+      );
+      if (write) {
+        await this.messageQueueHandler.sendQ10Write(
+          duid,
+          write.dp,
+          write.value
+        );
+      }
+      return;
+    }
+
     if (parameters && parameters.fan_power !== undefined) {
       await vacuum.command(duid, "set_custom_mode", parameters.fan_power);
     }
@@ -2284,7 +2425,10 @@ class Roborock {
     }
   }
 
+  // A stop or dock from Apple Home takes over the robot: drop the remaining
+  // items of a local scene run on it.
   async app_stop(duid) {
+    this.sceneRunner.cancel(duid);
     await this.startCommand(duid, "app_stop", null);
   }
 
@@ -2293,6 +2437,7 @@ class Roborock {
   }
 
   async app_charge(duid) {
+    this.sceneRunner.cancel(duid);
     await this.startCommand(duid, "app_charge", null);
   }
 
@@ -2312,6 +2457,316 @@ class Roborock {
       }))
       .filter((room) => Number.isFinite(room.segmentId))
       .sort((a, b) => a.segmentId - b.segmentId);
+  }
+
+  /**
+   * The loaded floor map's mapFlag (get_status map_status >> 2), or null when
+   * unknown or no map is loaded (63). Mirrors python-roborock current_map.
+   */
+  getCurrentMapFlag(duid) {
+    const mapStatus = this.getLiveStatus(duid, "map_status");
+    if (typeof mapStatus !== "number") {
+      return null;
+    }
+    const mapFlag = mapStatus >> 2;
+    return mapFlag === 63 ? null : mapFlag;
+  }
+
+  isMapDiscoveryRunning(duid) {
+    return this._mapDiscoveryRunning.has(duid);
+  }
+
+  // While discovery or switchToMap has another floor map loaded, a clean
+  // would run on the wrong map.
+  assertNoMapSwitch(duid, command) {
+    if (this.isMapDiscoveryRunning(duid)) {
+      throw new Error(
+        `${command}: ${duid} is switching floor maps. Try again in a minute.`
+      );
+    }
+  }
+
+  getMultiMapCachePath(duid) {
+    return this.getPersistPath(`multimap.${duid}.json`);
+  }
+
+  loadMultiMapCache(duid) {
+    if (this.multiMapData[duid]) {
+      return this.multiMapData[duid];
+    }
+    let data = { maps: [], rooms: {} };
+    try {
+      const raw = JSON.parse(
+        fs.readFileSync(this.getMultiMapCachePath(duid), "utf8")
+      );
+      if (raw && Array.isArray(raw.maps) && raw.rooms) {
+        data = raw;
+      }
+    } catch (error) {
+      // No cache yet.
+    }
+    this.multiMapData[duid] = data;
+    return data;
+  }
+
+  saveMultiMapCache(duid) {
+    try {
+      fs.writeFileSync(
+        this.getMultiMapCachePath(duid),
+        JSON.stringify(this.multiMapData[duid])
+      );
+    } catch (error) {
+      this.log.warn(`Failed to save multi-map cache: ${error.message}`);
+    }
+  }
+
+  /** Called by the get_room_mapping poll with the loaded map's rooms. */
+  recordCurrentMapRooms(duid, names) {
+    const mapFlag = this.getCurrentMapFlag(duid);
+    if (mapFlag === null) {
+      return;
+    }
+    const data = this.loadMultiMapCache(duid);
+    if (JSON.stringify(data.rooms[mapFlag] || {}) !== JSON.stringify(names)) {
+      data.rooms[mapFlag] = { ...names };
+      this.saveMultiMapCache(duid);
+    }
+  }
+
+  async requestRoomNames(duid) {
+    const mappedRooms = await this.messageQueueHandler.sendRequest(
+      duid,
+      "get_room_mapping",
+      []
+    );
+    const names = {};
+    for (const mappedRoom of mappedRooms || []) {
+      const roomName = this.roomIDs[mappedRoom[1]];
+      if (roomName) {
+        names[mappedRoom[0]] = roomName;
+      }
+    }
+    return names;
+  }
+
+  /**
+   * Refresh the saved floor-map list (get_multi_maps_list) and, when another
+   * map's rooms were never read, run the discovery. V1 devices only.
+   */
+  async refreshMultiMaps(duid) {
+    if (
+      this.getVacuumDeviceInfo(duid, "pv") !== "1.0" ||
+      this.isMapDiscoveryRunning(duid) ||
+      !this.shouldPollMethod(duid, "get_multi_maps_list")
+    ) {
+      return;
+    }
+    let list;
+    try {
+      const result = await this.messageQueueHandler.sendRequest(
+        duid,
+        "get_multi_maps_list",
+        []
+      );
+      list = Array.isArray(result) ? result[0] : result;
+    } catch (error) {
+      this.log.debug(`get_multi_maps_list failed: ${error && error.message}`);
+      return;
+    }
+    const maps = ((list && list.map_info) || [])
+      .filter((info) => typeof info.mapFlag === "number")
+      .map((info) => ({
+        mapFlag: info.mapFlag,
+        name: String(info.name || `Map ${info.mapFlag + 1}`),
+      }));
+    const data = this.loadMultiMapCache(duid);
+    const flags = new Set(maps.map((map) => map.mapFlag));
+    if (JSON.stringify(data.maps) !== JSON.stringify(maps)) {
+      data.maps = maps;
+      // Drop rooms of maps that were deleted in the Roborock app.
+      for (const flag of Object.keys(data.rooms)) {
+        if (!flags.has(Number(flag))) {
+          delete data.rooms[flag];
+        }
+      }
+      this.saveMultiMapCache(duid);
+    }
+    // The loaded map's rooms come from the get_room_mapping poll; only maps
+    // that were never read need the discovery.
+    const current = this.getCurrentMapFlag(duid);
+    const due =
+      maps.length > 1 &&
+      maps.some((map) => map.mapFlag !== current && !data.rooms[map.mapFlag]);
+    if (due) {
+      await this.discoverMultiMapRooms(duid);
+    }
+  }
+
+  /**
+   * Learn the other floor maps' rooms. The firmware only reports rooms for the
+   * loaded map, so — like python-roborock's HomeTrait.discover_home — each map
+   * not read yet is loaded in turn (load_multi_map), its rooms read, and the
+   * original map loaded again last. Only runs while the robot is on its dock;
+   * the robot does not move, the map selection merely changes for a few
+   * seconds. Each map is tried once: one without named rooms, or that did not
+   * load, is published as a whole floor until its rooms are read while it is
+   * loaded (the get_room_mapping poll, or switchToMap for a clean).
+   */
+  async discoverMultiMapRooms(duid) {
+    const state = this.getVacuumDeviceStatus(duid, "state");
+    if (!DOCKED_STATES.includes(state)) {
+      this.log.debug(
+        `Multi-map discovery postponed: vacuum not on its dock (state ${state}).`
+      );
+      return;
+    }
+    const original = this.getCurrentMapFlag(duid);
+    const data = this.loadMultiMapCache(duid);
+    if (original === null || !data.maps.some((m) => m.mapFlag === original)) {
+      this.log.debug("Multi-map discovery postponed: loaded map unknown.");
+      return;
+    }
+    this._mapDiscoveryRunning.add(duid);
+    this.log.info(
+      `Multi-map discovery: reading rooms of ${data.maps.length} floor map(s); restoring map ${original} afterwards.`
+    );
+    let switched = false;
+    try {
+      for (const map of data.maps) {
+        if (map.mapFlag === original || data.rooms[map.mapFlag]) {
+          continue;
+        }
+        // A clean started in between (a schedule on the robot): stop here.
+        const now = this.getVacuumDeviceStatus(duid, "state");
+        if (!DOCKED_STATES.includes(now)) {
+          this.log.warn(
+            `Multi-map discovery stopped: vacuum left its dock (state ${now}).`
+          );
+          break;
+        }
+        data.rooms[map.mapFlag] = {};
+        switched = true;
+        await this.loadMap(duid, map.mapFlag);
+        let names = await this.requestRoomNames(duid);
+        if (Object.keys(names).length === 0) {
+          // The firmware can answer with an empty mapping right after a map
+          // load; give it longer once.
+          await sleep(7000);
+          names = await this.requestRoomNames(duid);
+        }
+        this.log.info(
+          `Multi-map discovery: '${map.name}' has ${Object.keys(names).length} named room(s).`
+        );
+        data.rooms[map.mapFlag] = names;
+      }
+    } catch (error) {
+      this.log.error(`Multi-map discovery failed: ${error && error.message}`);
+    } finally {
+      try {
+        if (switched) {
+          await this.loadMap(duid, original);
+        }
+        data.rooms[original] = await this.requestRoomNames(duid);
+      } catch (error) {
+        this.log.error(
+          `Multi-map discovery could not restore map ${original} (${error && error.message}); select the right floor in the Roborock app.`
+        );
+      }
+      this._mapDiscoveryRunning.delete(duid);
+      this.saveMultiMapCache(duid);
+    }
+  }
+
+  /**
+   * Load a saved floor map (load_multi_map) and wait until get_status reports
+   * it loaded. Throws when it is not loaded after about 12 s.
+   */
+  async loadMap(duid, mapFlag) {
+    await this.messageQueueHandler.sendRequest(duid, "load_multi_map", [
+      mapFlag,
+    ]);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await sleep(3000);
+      await this.pollStatus(duid);
+      if (this.getCurrentMapFlag(duid) === mapFlag) {
+        return;
+      }
+    }
+    throw new Error(`map ${mapFlag} did not load`);
+  }
+
+  /**
+   * Make sure a saved floor map is loaded before a room clean on it, loading
+   * it when another one is, like a Roborock scene that switches maps. Maps
+   * are only switched while the robot is on its dock. Returns the loaded
+   * map's { segmentId: name } as the vacuum reports it now, so the caller can
+   * check the rooms it is about to clean; throws when the switch did not
+   * take.
+   */
+  async switchToMap(duid, mapFlag) {
+    await this.pollStatus(duid);
+    if (this.isMapDiscoveryRunning(duid)) {
+      throw new Error("multi-map discovery is running");
+    }
+    if (this.getCurrentMapFlag(duid) !== mapFlag) {
+      const state = this.getVacuumDeviceStatus(duid, "state");
+      if (!DOCKED_STATES.includes(state)) {
+        throw new Error(
+          `vacuum is not on its dock (state ${state}); not switching maps`
+        );
+      }
+      this._mapDiscoveryRunning.add(duid);
+      try {
+        await this.loadMap(duid, mapFlag);
+      } finally {
+        this._mapDiscoveryRunning.delete(duid);
+      }
+    }
+    const names = await this.requestRoomNames(duid);
+    this.segmentRoomNames[duid] = names;
+    // Rooms renamed or re-divided since they were cached are published on
+    // the next update, so a refused clean works when tried again.
+    this.recordCurrentMapRooms(duid, names);
+    return names;
+  }
+
+  /**
+   * Every floor map and its rooms for the Matter ServiceArea cluster:
+   * { currentMapFlag, maps: [{ mapFlag, name }], rooms: [{ mapFlag,
+   * segmentId, name }] }. The loaded map's rooms come from the live
+   * get_room_mapping cache, the other maps' from the discovery cache.
+   * currentMapFlag is null while the loaded map is unknown (no fresh status).
+   */
+  getMultiMapAreas(duid) {
+    const data = this.loadMultiMapCache(duid);
+    const currentMapFlag = this.getCurrentMapFlag(duid);
+    if (data.maps.length < 2) {
+      // Single-map robot, or map list not read yet: publish the loaded map's
+      // rooms alone, as before.
+      const mapFlag = currentMapFlag === null ? 0 : currentMapFlag;
+      return {
+        currentMapFlag: mapFlag,
+        maps: [{ mapFlag, name: "Map" }],
+        rooms: this.getSegmentRooms(duid).map((room) => ({ mapFlag, ...room })),
+      };
+    }
+    const rooms = [];
+    for (const map of data.maps) {
+      const names =
+        map.mapFlag === currentMapFlag
+          ? (this.segmentRoomNames && this.segmentRoomNames[duid]) || {}
+          : data.rooms[map.mapFlag];
+      for (const segmentId of Object.keys(names || {}).sort((a, b) => a - b)) {
+        rooms.push({
+          mapFlag: map.mapFlag,
+          segmentId: Number(segmentId),
+          name: String(names[segmentId]),
+        });
+      }
+    }
+    // Every map is published, even one without named rooms: the Matter
+    // accessory adds a whole-floor area to each.
+    return { currentMapFlag, maps: [...data.maps], rooms };
   }
 
   /**
@@ -2336,6 +2791,7 @@ class Roborock {
       this.log.warn(`app_segment_clean: no valid segment ids for ${duid}.`);
       return;
     }
+    this.assertNoMapSwitch(duid, "app_segment_clean");
 
     await this.messageQueueHandler.sendRequest(duid, "app_segment_clean", [
       { segments: segments, repeat: repeat },
@@ -2372,23 +2828,28 @@ class Roborock {
    */
   getCleanModeCapabilities(duid) {
     let mopSupported = true;
+    let waterSlide = false;
 
     try {
       const features = this.vacuums[duid]?.features?.getFeatureList?.();
       if (features && typeof features.isWaterBoxSupported === "boolean") {
         mopSupported = features.isWaterBoxSupported;
       }
+      waterSlide = !!(features && features.isWaterSlideModeSupported);
     } catch (error) {
       this.log.debug(`getCleanModeCapabilities: ${error}`);
     }
 
-    // The Qrevo Edge 2 (a298) does not use the classic 200-203 water levels:
-    // it keeps 200 = Off but replaces 201-203 with banded levels 221-250,
-    // so writing the classic default 202 would be rejected by the device.
-    // 233 is the middle ("Medium") band. The sibling Qrevo Edge (a187) still
-    // uses the classic values.
+    // Water-slide models (the Qrevo Edge 2 / a298, the P30 Pro / a306, ...)
+    // do not use the classic 200-203 water levels: they keep 200 = Off but
+    // report and accept 220 + a slider position (1-30), so writing the
+    // classic default 202 would be rejected by the device. 233 lies in the
+    // app's "Medium" range. The feature bit finds them; the a298 is also
+    // listed by model in case its home data lacks the bit. The sibling
+    // Qrevo Edge (a187) still uses the classic values.
     const model = this.getProductAttribute(duid, "model");
-    const usesBandedWaterLevels = model === "roborock.vacuum.a298";
+    const usesBandedWaterLevels =
+      waterSlide || model === "roborock.vacuum.a298";
 
     return {
       fanOff: 105,
@@ -2397,6 +2858,21 @@ class Roborock {
       waterDefault: usesBandedWaterLevels ? 233 : 202,
       mopSupported: mopSupported,
     };
+  }
+
+  // Whether the battery is charging, given a known charge_status. On robots
+  // with off-peak charging, 0 while on the charger (state 8) means "waiting
+  // for off-peak power"; other robots report 0 while they charge, too.
+  isBatteryCharging(duid, chargeStatus, state) {
+    if (Number(chargeStatus) !== 0) {
+      return true;
+    }
+    if (Number(state) !== 8) {
+      return false;
+    }
+
+    const features = this.vacuums[duid]?.features?.getFeatureList?.();
+    return !(features && features.isSupportedValleyElectricity);
   }
 
   async getStatus(duid) {
@@ -2451,17 +2927,17 @@ class Roborock {
   // devices use a different method set). The HomeData deviceStatus snapshot
   // is a cloud-side copy that can lag behind the device, and older products'
   // schemas lack fields such as charge_status. python-roborock polls
-  // get_status for V1 status as well.
+  // get_status for V1 status as well. Returns whether the status was read.
   async pollStatus(duid) {
     if (this.getVacuumDeviceInfo(duid, "pv") !== "1.0") {
-      return;
+      return false;
     }
 
     if (!this.shouldPollMethod(duid, "get_status")) {
       this.log.debug(
         `Skipping get_status for ${duid}; backing off after repeated timeouts.`
       );
-      return;
+      return false;
     }
 
     try {
@@ -2470,9 +2946,12 @@ class Roborock {
         "get_status",
         []
       );
-      this.recordLiveStatus(duid, Array.isArray(result) ? result[0] : result);
+      const status = Array.isArray(result) ? result[0] : result;
+      this.recordLiveStatus(duid, status);
+      return !!status && typeof status === "object";
     } catch (error) {
       this.catchError(error, "get_status", duid);
+      return false;
     }
   }
 
@@ -2514,6 +2993,36 @@ class Roborock {
     return true;
   }
 
+  // Remaining consumable life from get_consumable work times (seconds),
+  // rounded like the Roborock app. Recorded as live status, so it is served
+  // before the HomeData snapshot, and pushed to the accessories, which do not
+  // see a HomeData refresh while the cloud is down.
+  recordConsumables(duid, consumables) {
+    if (!consumables || typeof consumables !== "object") {
+      return;
+    }
+
+    const ratedHours = this.getConsumableRatedHours(duid);
+    const life = {};
+    for (const [name, hours] of Object.entries(ratedHours)) {
+      const workTime = consumables[`${name}_work_time`];
+      if (typeof workTime === "number") {
+        life[`${name}_life`] = Math.max(
+          0,
+          Math.round(100 - (workTime / (hours * 3600)) * 100)
+        );
+      }
+    }
+    if (Object.keys(life).length === 0) {
+      return;
+    }
+
+    this.recordLiveStatus(duid, life);
+    if (this.deviceNotify) {
+      this.deviceNotify("LocalMessage", life, duid);
+    }
+  }
+
   // Record named status fields (a get_status result) as live status.
   recordLiveStatus(duid, status) {
     if (!duid || !status || typeof status !== "object") {
@@ -2546,6 +3055,171 @@ class Roborock {
     this.recordLiveStatus(duid, status);
   }
 
+  // Rated consumable life in hours for a robot's model.
+  getConsumableRatedHours(duid) {
+    const model = this.getProductAttribute(duid, "model");
+    return CONSUMABLE_LIFE_HOURS[model] || CONSUMABLE_LIFE_HOURS.default;
+  }
+
+  // A Q10-series robot (protocol B01, model ss*); see lib/b01Q10.js.
+  isQ10Device(duid) {
+    const device = this.getVacuumDeviceData(duid);
+    if (!device || device.pv !== "B01") {
+      return false;
+    }
+    const products = this.products || this.getParsedHomeData()?.products || [];
+    const product = products.find((product) => product.id == device.productId);
+    return b01Q10.isQ10Model(device.pv, product && product.model);
+  }
+
+  describeRobot(duid) {
+    const name = this.vacuums[duid] && this.vacuums[duid].name;
+    return name ? `${name} (${duid})` : duid;
+  }
+
+  // Log a Q10 notice at info level once per run.
+  noteQ10Once(key, message) {
+    if (this.q10Notices.has(key)) {
+      return;
+    }
+    this.q10Notices.add(key);
+    this.log.info(message);
+  }
+
+  // Ask a Q10 to push its full status and its current map (dpRequestDps): it
+  // has no status read. A request that brings nothing back from the robot
+  // within 10 s counts toward the stalled-cloud-session check, as a timed-out
+  // V1 cloud request does. Nothing is sent while the robot is offline.
+  async requestQ10Status(duid) {
+    const requestedAt = Date.now();
+    try {
+      await this.messageQueueHandler.sendQ10Write(
+        duid,
+        b01Q10.DP.REQUEST_DPS,
+        {}
+      );
+    } catch (error) {
+      this.log.debug(
+        `Status request for ${this.describeRobot(duid)} was not sent: ${(error && error.message) || "no cloud connection"}`
+      );
+      return;
+    }
+
+    this.noteQ10Once(
+      `status:${duid}`,
+      `${this.describeRobot(duid)} is a Q10-series robot. It is controlled over the Roborock cloud and has no status read, so the plugin asks it to push its status every ${this.updateInterval} s and follows what it pushes.`
+    );
+
+    const timer = this.setTimeout(() => {
+      if ((this.q10LastMessageAt.get(duid) || 0) < requestedAt) {
+        this.log.debug(
+          `${this.describeRobot(duid)} pushed nothing within 10 s of a status request.`
+        );
+        this.recordCloudTimeout();
+      }
+    }, 10000);
+    if (timer && typeof timer.unref === "function") {
+      timer.unref();
+    }
+  }
+
+  // A Q10 data point push (protocol 102). It is folded into what the robot
+  // pushed before, translated to V1 status fields, recorded as live status
+  // and passed to the accessories.
+  handleQ10Push(duid, dps) {
+    if (!dps || typeof dps !== "object") {
+      return;
+    }
+
+    this.q10LastMessageAt.set(duid, Date.now());
+    const previous = this.q10Dps.get(duid) || {};
+    const pushed = b01Q10.flattenDps(dps);
+    const merged = { ...previous, ...pushed };
+    // dpFault keeps its value after an error is cleared. Once the robot
+    // leaves the error state, forget it, so a later error is not reported
+    // with the old fault before the robot pushes the new one.
+    const fault = String(b01Q10.DP.FAULT);
+    const state = String(b01Q10.DP.STATUS);
+    if (
+      Number(previous[state]) === 12 &&
+      Number(merged[state]) !== 12 &&
+      pushed[fault] === undefined
+    ) {
+      delete merged[fault];
+    }
+    this.q10Dps.set(duid, merged);
+
+    const { status, unknownState, unmappedFault } = b01Q10.toV1Status(merged, {
+      ratedHours: this.getConsumableRatedHours(duid),
+    });
+    this.log.debug(
+      `Q10 push from ${duid}: ${JSON.stringify(dps)} -> ${JSON.stringify(status)}`
+    );
+
+    if (unknownState !== undefined) {
+      this.noteQ10Once(
+        `state:${duid}:${unknownState}`,
+        `${this.describeRobot(duid)} reports state ${unknownState}, which the plugin does not know yet; Apple Home keeps the previous state. Please report it in the plugin's GitHub issues.`
+      );
+    }
+    if (unmappedFault !== undefined) {
+      this.noteQ10Once(
+        `fault:${duid}:${unmappedFault}`,
+        `${this.describeRobot(duid)} reports fault ${unmappedFault} (${b01Q10.describeFault(unmappedFault)}), which has no Apple Home equivalent; check the Roborock app.`
+      );
+    }
+
+    if (Object.keys(status).length === 0) {
+      return;
+    }
+    this.recordLiveStatus(duid, status);
+    if (this.deviceNotify) {
+      this.deviceNotify("CloudMessage", status, duid);
+    }
+  }
+
+  // A Q10 map or cleaning-path packet (protocol 301). The current map carries
+  // the room list, which feeds the Matter rooms and room cleaning.
+  handleQ10MapPacket(duid, payload) {
+    this.q10LastMessageAt.set(duid, Date.now());
+    const marker = payload.subarray(0, 2).toString("hex");
+    let map;
+    try {
+      map = b01Q10.parseMapRooms(payload);
+    } catch (error) {
+      this.log.debug(
+        `Q10 map packet ${marker} from ${duid} (${payload.length} bytes) could not be read: ${error.message}`
+      );
+      return;
+    }
+
+    this.log.debug(
+      `Q10 protocol 301 packet ${marker} from ${duid} (${payload.length} bytes)${map ? ` with ${map.rooms.length} room(s)` : ""}.`
+    );
+    if (!map) {
+      return;
+    }
+
+    const names = {};
+    for (const room of map.rooms) {
+      names[room.id] = room.name;
+    }
+    if (
+      JSON.stringify(this.segmentRoomNames[duid] || null) ===
+      JSON.stringify(names)
+    ) {
+      return;
+    }
+
+    this.segmentRoomNames[duid] = names;
+    this.log.info(
+      `Rooms of ${this.describeRobot(duid)}: ${map.rooms.map((room) => `${room.name} (${room.id})`).join(", ") || "none, the map is not divided into rooms"}.`
+    );
+    if (this.deviceNotify) {
+      this.deviceNotify("CloudMessage", {}, duid);
+    }
+  }
+
   // A live status field, or undefined when unknown or stale. Values older
   // than three poll intervals (polling stops while a device is offline) fall
   // back to the HomeData snapshot.
@@ -2562,6 +3236,16 @@ class Roborock {
     const liveValue = this.getLiveStatus(duid, property);
     if (liveValue !== undefined) {
       return liveValue;
+    }
+
+    // A Q10's HomeData snapshot holds its own data points, in its own units.
+    if (this.isQ10Device(duid)) {
+      const device = this.getVacuumDeviceData(duid);
+      const { status } = b01Q10.toV1Status(
+        b01Q10.flattenDps(device && device.deviceStatus),
+        { ratedHours: this.getConsumableRatedHours(duid) }
+      );
+      return status[property] !== undefined ? status[property] : "";
     }
 
     const propertyID = this.getVacuumSchemaId(duid, property);

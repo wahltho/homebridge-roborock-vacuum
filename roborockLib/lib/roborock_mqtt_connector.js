@@ -2,28 +2,26 @@
 
 const mqtt = require("mqtt");
 const crypto = require("crypto");
-const Parser = require("binary-parser").Parser;
 const zlib = require("zlib");
 
-const protocol301Parser = new Parser()
-  .endianess("little")
-  .string("endpoint", {
-    length: 15,
-    stripNull: true,
-  })
-  .uint8("unknown1")
-  .uint16("id")
-  .buffer("unknown2", {
-    length: 6,
-  });
+// Protocol 301 header (little-endian): endpoint(15, NUL-padded)
+// unknown(1) id(2) unknown(6). Returns null when the payload is too short to
+// carry one: B01 Q10 robots (roborock.vacuum.ss07) push their own binary map
+// and live-trace packets on protocol 301, and an empty trace is 14 bytes.
+function parse301Header(payload) {
+  if (payload.length < 24) {
+    return null;
+  }
+  return {
+    endpoint: payload.toString("utf8", 0, 15).replace(/\0+$/, ""),
+    id: payload.readUInt16LE(16),
+  };
+}
 
-const photoParser = new Parser()
-  .endianess("little")
-  .string("roborock", {
-    length: 8,
-    stripNull: true,
-  })
-  .uint8("id");
+// Photo chunk header: "ROBOROCK"(8) id(1).
+function parsePhotoHeader(payload) {
+  return { id: payload.readUInt8(8) };
+}
 
 let mqttUser;
 let mqttPassword;
@@ -188,6 +186,47 @@ class roborock_mqtt_connector {
     return null;
   }
 
+  // Settle the pending request a protocol 102 reply answers. A secure or
+  // photo request (get_map_v1, get_photo) is first acknowledged with "ok"
+  // and gets its data with protocol 300/301, so that "ok" is not its answer.
+  // For every other request "ok" (sent as "ok" or ["ok"]) is the answer.
+  resolveResponse(dps) {
+    const pending = this.adapter.pendingRequests.get(dps.id);
+    const isAck =
+      dps.result === "ok" ||
+      (Array.isArray(dps.result) && dps.result[0] === "ok");
+    if (!pending || (pending.awaitsPayload && isAck)) {
+      return;
+    }
+
+    this.adapter.clearTimeout(pending.timeout);
+    this.adapter.pendingRequests.delete(dps.id);
+    pending.resolve(dps.result);
+  }
+
+  // Q10 robots push data points on protocol 102 and map packets on protocol
+  // 301, neither in the V1 layout handled in initMQTT_Message (see
+  // lib/b01Q10.js).
+  handleQ10Message(duid, data) {
+    if (data.protocol == 301) {
+      this.adapter.handleQ10MapPacket(duid, data.payload);
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(data.payload.toString("utf8"));
+    } catch (error) {
+      this.adapter.log.debug(
+        `Unreadable Q10 message from ${duid}: ${error.message}`
+      );
+      return;
+    }
+    if (parsed && parsed.dps && typeof parsed.dps === "object") {
+      this.adapter.handleQ10Push(duid, parsed.dps);
+    }
+  }
+
   async initMQTT_Message() {
     this.adapter.log.info(`MQTT initialized`);
 
@@ -207,6 +246,15 @@ class roborock_mqtt_connector {
 
         const data = this.adapter.message._decodeMsg(message, duid);
         if (!data) {
+          return;
+        }
+
+        if (
+          (data.protocol == 102 || data.protocol == 301) &&
+          typeof this.adapter.isQ10Device === "function" &&
+          this.adapter.isQ10Device(duid)
+        ) {
+          this.handleQ10Message(duid, data);
           return;
         }
         // this.adapter.log.debug(`MESSAGE RECEIVED for duid ${duid} with key: ${this.adapter.localKeys.get(duid)} data: ${JSON.stringify(data)} raw: ${JSON.stringify(mqttMessageParser.parse(message))} message: ${message}`);
@@ -254,21 +302,11 @@ class roborock_mqtt_connector {
             }
           }
 
-          // special check for secure request like get_map_v1 etc. Don't process if result is OK. Instead wait for the actual response for protocol 301
-          if (dps.result != "ok") {
-            if (this.adapter.pendingRequests.has(dps.id)) {
-              const { resolve, timeout } = this.adapter.pendingRequests.get(
-                dps.id
-              );
-              this.adapter.clearTimeout(timeout);
-              this.adapter.pendingRequests.delete(dps.id);
-              resolve(dps.result);
-            }
-          }
+          this.resolveResponse(dps);
           // protocol 300 seems to be for get_photo 0 only. get_photo 0 is for large images. 1 is for small images.
         } else if (data.protocol == 300) {
           if (data.payload.subarray(0, 8) == "ROBOROCK") {
-            const photoData = photoParser.parse(data.payload);
+            const photoData = parsePhotoHeader(data.payload);
 
             if (this.adapter.pendingRequests.has(photoData.id)) {
               this.adapter.log.debug(`First photo gzip chunk detected!`);
@@ -278,7 +316,7 @@ class roborock_mqtt_connector {
             }
           }
         } else if (data.protocol == 301) {
-          const data2 = protocol301Parser.parse(data.payload.subarray(0, 24));
+          const data2 = parse301Header(data.payload.subarray(0, 24));
 
           if (
             data.seq == 2 &&
@@ -309,7 +347,7 @@ class roborock_mqtt_connector {
             }
           } else {
             if (data.payload.subarray(0, 8) == "ROBOROCK") {
-              const photoData = photoParser.parse(data.payload);
+              const photoData = parsePhotoHeader(data.payload);
               this.adapter.log.debug(
                 `Cloud message with protocol 301 and photo id ${photoData.id} received.`
               );
@@ -325,7 +363,11 @@ class roborock_mqtt_connector {
                 );
                 resolve(data.payload.slice(56));
               }
-            } else if (endpoint.startsWith(data2.endpoint)) {
+            } else if (
+              data2 &&
+              data2.endpoint &&
+              endpoint.startsWith(data2.endpoint)
+            ) {
               const iv = Buffer.alloc(16, 0);
               const decipher = crypto.createDecipheriv(
                 "aes-128-cbc",
@@ -357,6 +399,10 @@ class roborock_mqtt_connector {
                   resolve(decompressed);
                 }
               });
+            } else {
+              this.adapter.log.debug(
+                `Ignoring protocol 301 message for ${duid} (${data.payload.length} bytes); it is not a map response to this client.`
+              );
             }
           }
         } else if (data.protocol == 500) {

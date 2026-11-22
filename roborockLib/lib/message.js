@@ -2,7 +2,6 @@
 
 const crypto = require("crypto");
 const CRC32 = require("crc-32");
-const Parser = require("binary-parser").Parser;
 const { getRsaKeys } = require("./rsaKeys");
 
 let seq = 1;
@@ -11,21 +10,6 @@ let random = 4711; // Should be initialized with a number 0 - 1999?
 // This value is stored hardcoded in librrcodec.so, encrypted by the value of "com.roborock.iotsdk.appsecret" from AndroidManifest.xml.
 const salt = "TXdfu$jyZ#TZHsg4";
 const b01Salt = "5wwh9ikChRjASpMU8cxg7o1d2E";
-
-const messageParser = new Parser()
-  .endianess("big")
-  .string("version", {
-    length: 3,
-  })
-  .uint32("seq")
-  .uint32("random")
-  .uint32("timestamp")
-  .uint16("protocol")
-  .uint16("payloadLen")
-  .buffer("payload", {
-    length: "payloadLen",
-  })
-  .uint32("crc32");
 
 class message {
   constructor(adapter) {
@@ -46,7 +30,10 @@ class message {
   ) {
     const timestamp = Math.floor(Date.now() / 1000);
     const endpoint = this.adapter.rr_mqtt_connector.getEndpoint();
-    const version = await this.adapter.getRobotVersion(duid);
+    const version = await this.adapter.getRobotVersion(
+      duid,
+      protocol == 101 ? "cloud" : "local"
+    );
     // this.adapter.log.debug("sendRequest started with: " + requestId);
 
     if (photo) {
@@ -100,21 +87,30 @@ class message {
   }
 
   async buildRoborockMessage(duid, protocol, timestamp, payload, options = {}) {
-    const version = await this.adapter.getRobotVersion(duid);
+    // Protocol 101 is the cloud (MQTT) request; everything else goes over the
+    // local TCP connection, whose protocol version can differ from HomeData's.
+    // options.version overrides both, for probing the local protocol.
+    const version =
+      options.version ||
+      (await this.adapter.getRobotVersion(
+        duid,
+        protocol == 101 ? "cloud" : "local"
+      ));
 
     let encrypted;
 
     const currentSeq = seq & 0xffffffff;
     const currentRandom = random & 0xffffffff;
 
-    // Header-only frames (the L01 HELLO request, protocol 0) carry no encrypted
-    // payload, so they have NO payloadLen field — just version(3) + seq(4) + random(4)
-    // + timestamp(4) + protocol(2) + CRC32(4) = 21 bytes. (The previous build emitted a
+    // Header-only frames (HELLO request/response, protocols 0/1, and PING
+    // request/response, protocols 2/3) carry no encrypted payload, so they have
+    // NO payloadLen field — just version(3) + seq(4) + random(4) + timestamp(4)
+    // + protocol(2) + CRC32(4) = 21 bytes. (The previous build emitted a
     // 23-byte frame with a spurious payloadLen, which L01 robots silently drop, so the
     // handshake never completed.) Optional explicit seq/random let the HELLO pin seq=1
     // and a stable connect_nonce without disturbing the module-global counters used by
     // data messages.
-    if (protocol == 0 || protocol == 1) {
+    if (protocol >= 0 && protocol <= 3) {
       const headerSeq =
         (options.seq !== undefined ? options.seq : currentSeq) >>> 0;
       const headerRandom =
@@ -312,8 +308,20 @@ class message {
     }
   }
 
+  // Frame layout (big-endian): version(3) seq(4) random(4) timestamp(4)
+  // protocol(2) payloadLen(2) payload crc32(4).
   getParsedData(data) {
-    return messageParser.parse(data);
+    const payloadLen = data.readUInt16BE(17);
+    return {
+      version: data.toString("utf8", 0, 3),
+      seq: data.readUInt32BE(3),
+      random: data.readUInt32BE(7),
+      timestamp: data.readUInt32BE(11),
+      protocol: data.readUInt16BE(15),
+      payloadLen,
+      payload: data.subarray(19, 19 + payloadLen),
+      crc32: data.readUInt32BE(19 + payloadLen),
+    };
   }
 
   _encodeTimestamp(timestamp) {

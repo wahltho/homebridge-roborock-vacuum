@@ -90,7 +90,7 @@ export default class RoborockVacuumAccessory {
       .onSet(this.setActive.bind(this))
       .onGet(this.getActive.bind(this));
 
-    // Device error code and cloud online flag, surfaced on the main service.
+    // Device error code and reachability, surfaced on the main service.
     this.services["Fan"].addOptionalCharacteristic(
       this.platform.Characteristic.StatusFault
     );
@@ -162,17 +162,7 @@ export default class RoborockVacuumAccessory {
           "dock-wash"
         );
 
-      switchService.setCharacteristic(
-        this.platform.Characteristic.Name,
-        switchName
-      );
-      switchService.addOptionalCharacteristic(
-        this.platform.Characteristic.ConfiguredName
-      );
-      switchService.setCharacteristic(
-        this.platform.Characteristic.ConfiguredName,
-        switchName
-      );
+      this.applyDefaultName(switchService, switchName);
 
       switchService
         .getCharacteristic(this.platform.Characteristic.On)
@@ -267,12 +257,7 @@ export default class RoborockVacuumAccessory {
         "charge_status"
       );
       if (chargeStatus !== "") {
-        this.services["Battery"].updateCharacteristic(
-          this.platform.Characteristic.ChargingState,
-          Number(chargeStatus) != 0
-            ? this.platform.Characteristic.ChargingState.CHARGING
-            : this.platform.Characteristic.ChargingState.NOT_CHARGING
-        );
+        this.updateChargingState(chargeStatus, state);
       }
 
       // The firmware version (fv) may be missing from the first HomeData
@@ -295,12 +280,15 @@ export default class RoborockVacuumAccessory {
         this.platform.roborockAPI.getVacuumDeviceStatus(this.duid, "error_code")
       );
 
-      // Cloud-reported online flag; anything but an explicit false counts as
-      // online so an unknown value never flags a healthy device.
+      // A working local connection means reachable, whatever the cloud says.
+      // Without one, the cloud online flag decides; anything but an explicit
+      // false counts as online so an unknown value never flags a healthy
+      // device.
       this.services["Fan"].updateCharacteristic(
         this.platform.Characteristic.StatusActive,
-        this.platform.roborockAPI.getVacuumDeviceInfo(this.duid, "online") !==
-          false
+        this.platform.roborockAPI.isLocallyConnected(this.duid) ||
+          this.platform.roborockAPI.getVacuumDeviceInfo(this.duid, "online") !==
+            false
       );
 
       this.updateConsumables();
@@ -311,6 +299,22 @@ export default class RoborockVacuumAccessory {
     } catch (e) {
       this.platform.log.error("Error updating device state: " + e);
     }
+  }
+
+  private updateChargingState(
+    chargeStatus: number | string,
+    state: number | string
+  ) {
+    this.services["Battery"].updateCharacteristic(
+      this.platform.Characteristic.ChargingState,
+      this.platform.roborockAPI.isBatteryCharging(
+        this.duid,
+        chargeStatus,
+        state
+      )
+        ? this.platform.Characteristic.ChargingState.CHARGING
+        : this.platform.Characteristic.ChargingState.NOT_CHARGING
+    );
   }
 
   private updateStatusFault(errorCode: unknown) {
@@ -381,6 +385,47 @@ export default class RoborockVacuumAccessory {
   }
 
   /**
+   * Give a switch the plugin's default name without undoing a rename made in
+   * the Home app. Controllers cannot write Name, so it always holds the last
+   * default the plugin assigned; the Home app stores a rename in
+   * ConfiguredName. Both survive restarts in the accessory cache, so a
+   * ConfiguredName that is empty or still equals the cached Name was never
+   * renamed and follows the new default (a language change, a scene renamed
+   * in the Roborock app). A renamed one is left alone.
+   */
+  private applyDefaultName(service: Service, name: string) {
+    const { Name, ConfiguredName } = this.platform.Characteristic;
+    // A cached service already has it; adding it again would grow the
+    // cached optional characteristics list on every start.
+    if (!service.testCharacteristic(ConfiguredName)) {
+      service.addOptionalCharacteristic(ConfiguredName);
+    }
+    const configuredName = service.getCharacteristic(ConfiguredName);
+
+    const previousDefault = service.getCharacteristic(Name).value;
+    const shownName = configuredName.value;
+
+    service.setCharacteristic(Name, name);
+    if (!shownName || shownName === previousDefault) {
+      service.setCharacteristic(ConfiguredName, name);
+    } else if (shownName !== name) {
+      this.platform.log.debug(
+        `Keeping the Home app name '${shownName}' instead of '${name}'`
+      );
+    }
+
+    // Save a rename right away. Homebridge writes the cache only on a clean
+    // shutdown, so after a crash the cached ConfiguredName would still equal
+    // Name and the next start would overwrite the rename. Only a controller
+    // write has an originator; the plugin's own sets also report "write".
+    configuredName.on("change", (change) => {
+      if (String(change.reason) === "write" && change.originator) {
+        this.platform.saveAccessory(this.accessory);
+      }
+    });
+  }
+
+  /**
    * Update scene switches based on available scenes for this device
    */
   updateSceneSwitches() {
@@ -402,10 +447,11 @@ export default class RoborockVacuumAccessory {
         for (const scene of deviceScenes) {
           try {
             const sceneId = scene.id.toString();
-            const sceneName = scene.name.replace(/ /g, "_");
+            const sceneName =
+              String(scene.name ?? "").trim() || `Scene ${sceneId}`;
             if (!this.sceneServices.has(sceneId) && scene.enabled) {
               this.platform.log.debug(
-                `Adding scene switch for: ${scene.name} (ID: ${sceneId})`
+                `Adding scene switch for: ${sceneName} (ID: ${sceneId})`
               );
 
               const switchService =
@@ -419,18 +465,7 @@ export default class RoborockVacuumAccessory {
                   `scene-${sceneId}`
                 );
 
-              switchService.setCharacteristic(
-                this.platform.Characteristic.Name,
-                sceneName
-              );
-
-              switchService.addOptionalCharacteristic(
-                this.platform.Characteristic.ConfiguredName
-              );
-              switchService.setCharacteristic(
-                this.platform.Characteristic.ConfiguredName,
-                sceneName
-              );
+              this.applyDefaultName(switchService, sceneName);
 
               switchService
                 .getCharacteristic(this.platform.Characteristic.On)
@@ -499,9 +534,16 @@ export default class RoborockVacuumAccessory {
       this.platform.log.debug(`Scene switch ${sceneId} set to: ${value}`);
 
       if (value) {
-        // Execute the scene
-        await this.platform.roborockAPI.executeScene({ val: sceneId });
-        this.platform.log.info(`Executed scene ID: ${sceneId}`);
+        // Not awaited: a local run waits for the robot to accept its first
+        // step, which must not hold up the Home app.
+        this.platform.roborockAPI
+          .executeScene({ val: sceneId })
+          .then(() => this.platform.log.info(`Executed scene ID: ${sceneId}`))
+          .catch((error) =>
+            this.platform.log.error(
+              `Error executing scene ${sceneId}: ${error}`
+            )
+          );
 
         // Turn off the switch after execution (momentary switch behavior)
         setTimeout(() => {
@@ -571,11 +613,13 @@ export default class RoborockVacuumAccessory {
         }
 
         if (data.hasOwnProperty("charge_status")) {
-          this.services["Battery"].updateCharacteristic(
-            this.platform.Characteristic.ChargingState,
-            data.charge_status != 0
-              ? this.platform.Characteristic.ChargingState.CHARGING
-              : this.platform.Characteristic.ChargingState.NOT_CHARGING
+          this.updateChargingState(
+            data.charge_status,
+            data.state ??
+              this.platform.roborockAPI.getVacuumDeviceStatus(
+                this.duid,
+                "state"
+              )
           );
         }
 
@@ -590,6 +634,11 @@ export default class RoborockVacuumAccessory {
 
         if (data.hasOwnProperty("error_code")) {
           this.updateStatusFault(data.error_code);
+        }
+
+        // Consumable life computed from a get_consumable read.
+        if (CONSUMABLES.some(({ code }) => data.hasOwnProperty(code))) {
+          this.updateConsumables();
         }
       } else if (id == "HomeData") {
         this.updateDeviceState();

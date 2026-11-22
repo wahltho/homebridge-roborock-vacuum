@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.5.0+wahltho.1
+
+- Keep per-device cloud routing after three unanswered LAN requests, including after a TCP reconnect. Earlier local failures can use the upstream single cloud retry.
+- Keep the warning for empty room mappings once per device until a valid mapping arrives, including with multi-map discovery.
+
+## 2.5.0
+
+- **New (Q10 series)**: Q10 robots (`roborock.vacuum.ss07`, such as the Q10 S5+) can be controlled (#64). They speak their own protocol: a command is a numbered data point that the robot never answers, and its status, map and rooms arrive as pushes. The plugin used to send them the commands of other models, which they ignore, so every command and poll timed out (`Cloud request with id … timed out after 10 seconds`). Start, pause, resume, stop, return to dock, Matter room cleaning and clean modes, state, battery, charging, filter and brush life, and faults now work through the Roborock cloud; see "Q10 series" in the README
+- **Fix (cloud)**: Protocol 301 packets that are not map replies to the plugin, such as the 14-byte cleaning-path packets of Q10 robots, are no longer read as map replies. Each one logged `RangeError: The value of "offset" is out of range` (#64)
+
+## 2.4.1
+
+- **Fix (scenes)**: A scene run over the LAN no longer stops when the vacuum refuses the next step right after docking (#63). Some vacuums, such as the S8 MaxV Ultra, report "charging" while the dock is still washing the mop, so the plugin sent the next step too early, the vacuum refused it, and the remaining steps were dropped (`Scene "…" stopped because the robot did not accept it`). A refused step is now sent again every 30 seconds, once the vacuum reports idle, for up to 10 minutes; the log shows `was not accepted; the dock may still be busy` when this happens
+- **Fix (scenes)**: A refused step is no longer counted as started when the dock begins emptying the bin or washing the mop right after it. The plugin then waited for the dock and moved on to the following step, so the rooms of the refused step were silently skipped
+
+## 2.4.0
+
+- **New (Matter)**: Vacuums with several saved floor maps publish every floor with its rooms; Apple Home shows a **Cleaning Map** picker (#62). Each map's rooms are read once while the vacuum is on its dock: the plugin loads the map for a few seconds and then the original one again, and the vacuum does not move. Starting a clean of another floor's rooms loads that map first, like a Roborock scene; the vacuum must already be on that floor. Every room clean first checks the vacuum's own room list, so a room renamed or re-divided in the Roborock app since the last refresh is refused instead of cleaning another segment. A floor without named rooms is published as one area that cleans the whole floor. The first map, and vacuums with a single map, keep their area ids, so existing room selections and automations keep working. See "Multi-floor maps" in the README
+- **Fix (Matter)**: After the vacuum changes floors, the rooms of the previous floor map are no longer listed with the new one
+
+## 2.3.0
+
+- **New (connectivity)**: Every feature now uses the local connection first and the Roborock cloud only as the fallback. The cloud is still needed to sign in and to read the device and scene lists. See "Cloud outages and local-only mode" in the README
+- **New (scenes)**: Scenes run over the LAN when every step is a command for a vacuum the plugin is connected to locally. Steps run in order: the next one starts once the vacuum is back on the dock and the dock has finished emptying and washing the mop. Stopping or docking the vacuum from Apple Home, starting another scene on it, or restarting Homebridge drops the remaining steps, and a step that fails or a vacuum error stops the run with a log line naming the steps that were skipped. Scenes with other steps, shared vacuums or a vacuum without a local connection, and scenes whose first step the vacuum does not accept locally, are run by the cloud as before. A scene run locally may not appear in the Roborock app's history
+- **New (scenes)**: The scene list is saved on disk (owner-readable only) on every fetch, so scene switches and Matter scene buttons are created and work in local-only mode. A list saved for another account is ignored
+- **Improvement (status)**: Apple Home follows the vacuum sooner. Status is read from the vacuum every 15 seconds while it is cleaning, returning or docking, and while the cloud push channel is down, instead of only on the regular refresh (180 seconds by default)
+- **Improvement (connectivity)**: A command whose local request times out or cannot be sent is retried once through the cloud, instead of failing. Cloud fallbacks are logged once per command and vacuum until the vacuum answers locally again
+- **Improvement (HAP)**: Filter and brush life are computed from the vacuum's own work times, like the Roborock app, and keep updating while the cloud is down. The cloud's copy is used when the vacuum does not report a consumable
+- **Fix (HAP)**: A vacuum with a working local connection is no longer shown as "Not Responding" when the cloud reports it offline
+- **Fix (connectivity)**: A command sent through the cloud no longer reports a timeout after the vacuum carried it out. The vacuum's `ok` answer was ignored, so the request waited 10 seconds and logged `Cloud request ... timed out` although the vacuum had started, stopped or docked. Only map and photo requests, which send their data after the `ok`, still wait for it
+- **Fix (charging)**: Vacuums that charge while reporting `charge_status` 0 are shown as charging again in Apple Home (HAP and Matter). Only vacuums with off-peak charging use 0 for "waiting for off-peak power"; the others report it while they charge on the dock too. The off-peak capability is read from the vacuum's feature set
+- **Fix (Matter)**: Switching to a mop mode works on every vacuum with the 30-step water slider, such as the P30 Pro, not only the Qrevo Edge 2. They reject the classic water level 202, so the plugin now recognizes them from their feature set and sends a slider value from the app's "Medium" range
+- **Change (packaging)**: Fewer dependencies: the plugin installs 49 packages instead of 101. Cloud requests use Node's built-in `fetch` instead of `axios`, protocol frames are read without `binary-parser`, and the settings page draws Matter pairing QR codes with the dependency-free `qrcode-generator` instead of `qrcode`. This removes the dependencies behind most of the supply-chain alerts on socket.dev (code generated at runtime with `eval`/`Function`, packages with a Socket replacement, trivial packages) and the stale `jszip` entry in the lockfile. The cloud requests no longer use a proxy set in the `HTTP_PROXY`/`HTTPS_PROXY` environment variables
+- **Improvement (connectivity)**: When a vacuum cannot be reached at its known LAN address, the plugin looks for it with UDP discovery before asking the cloud for its new address. A UDP discovery port taken by another integration is warned about once
+
+## 2.2.11
+
+- **Fix (HAP)**: Scene switches are named exactly like the scene in the Roborock app. Spaces used to be replaced with underscores ("Vacuum the Bedroom" became "Vacuum_the_Bedroom"), so Siri did not match the name you say. Leading and trailing spaces are dropped. Existing switches take the new name on the next restart unless you renamed them in the Home app. A scene without a name is called "Scene <id>", as the Matter scene buttons already were
+- **Fix (HAP)**: A scene switch or dock mop-wash switch you renamed in the Home app keeps that name when Homebridge restarts. The plugin wrote its own name back on every start. The rename is saved to the accessory cache right away, so it also survives Homebridge stopping without a clean shutdown. Switches you have not renamed still pick up a language change, or a scene renamed in the Roborock app, on the next restart
+
+## 2.2.10
+
+- **Fix (connectivity)**: Vacuums whose home data reports protocol `1.0` but that only speak L01 on the LAN, such as the S8 MaxV Ultra (`roborock.vacuum.a97`) on firmware 02.39.x, are controlled locally again (#61). The plugin talked `1.0` to them, the vacuum ignored every local request, and each one timed out after 10 s before falling back to the cloud. Before connecting to a vacuum that reports `1.0`, the plugin now sends it an L01 hello on a separate connection; if the vacuum answers, its local connection uses L01, while cloud requests keep `1.0`. Vacuums that speak `1.0` do not answer, so connecting to them takes up to 3 s longer, and nothing else changes for them. The log shows `reports protocol 1.0 but answers L01 locally` when a vacuum is switched
+- **Fix (connectivity)**: Local L01 connections are no longer dropped after a minute of inactivity (#61). L01 vacuums close a connection that carries no traffic for 60 s, and the plugin reconnected only after another 60 s, so the vacuum spent about half the time without a local connection and commands went through the cloud. The plugin now sends a keepalive ping every 30 s on L01 connections. `1.0` connections stay open by themselves and get no ping
+- **Docs**: The S8 MaxV Ultra is listed among the supported models, and the README explains the local protocol detection
+
 ## 2.2.9+wahltho.1
 
 - **Upstream 2.2.9**: Includes local-only startup from cached cloud data, live device status, Matter room and charging fixes, current agreement versions during login, device-error clearing, and recovery of silent cloud MQTT sessions from the upstream 2.2.7 through 2.2.9 releases below.

@@ -339,9 +339,7 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
             continue;
           }
           matterVacuum.updateFromRoborockData(data);
-          matterVacuum.updateSupportedAreas(
-            self.roborockAPI.getSegmentRooms(matterDuid) ?? []
-          );
+          matterVacuum.updateSupportedAreas();
         }
         for (const [dockDuid, dockWash] of self.matterDockWash) {
           if (duid === undefined || dockDuid === duid) {
@@ -366,6 +364,8 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
         // way updateDeviceState does for the HAP accessories.
         for (const matterVacuum of self.matterVacuums.values()) {
           matterVacuum.refreshFromDevice();
+          // Floor maps and their rooms (multi-map discovery).
+          matterVacuum.updateSupportedAreas();
         }
         // Keep the dock-wash switches in line with the cached device state.
         for (const dockWash of self.matterDockWash.values()) {
@@ -1049,5 +1049,14 @@ export default class RoborockPlatform implements DynamicPlatformPlugin {
 
   createRoborockAccessory(accessory: PlatformAccessory<String>) {
     this.vacuums.push(new RoborockVacuumAccessory(this, accessory));
+  }
+
+  /**
+   * Write the accessory cache to disk now. Homebridge otherwise saves it only
+   * when accessories are registered, updated or removed, and on a clean
+   * shutdown.
+   */
+  saveAccessory(accessory: PlatformAccessory<String>) {
+    this.api.updatePlatformAccessories([accessory]);
   }
 }
